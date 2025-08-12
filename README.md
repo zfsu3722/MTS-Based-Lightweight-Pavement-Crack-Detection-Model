@@ -1,4 +1,3 @@
-
 This project is the code for the paper, A Lightweight Road Crack Detection Model Based on Multilevel Thresholding Image Segmentation, submitted to T-ITS for consideration. The test datasets are included. The proposed model is ligtweight and effective.
 
 ## Requirements
