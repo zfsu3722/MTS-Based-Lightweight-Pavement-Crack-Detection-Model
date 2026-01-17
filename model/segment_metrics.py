@@ -1,3 +1,11 @@
+# Author: Yahui Liu <yahui.liu@unitn.it>
+
+"""
+Calculate Segmentation metrics:
+ - GlobalAccuracy
+ - MeanAccuracy
+ - Mean MeanIoU
+"""
 
 import numpy as np
 from data_io import imread

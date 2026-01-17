@@ -1,4 +1,3 @@
-
 import os
 import cv2
 import numpy as np
@@ -17,7 +16,8 @@ def imread(path, load_size=0, load_mode=cv2.IMREAD_GRAYSCALE, convert_rgb=False,
 
 def get_image_pairs(data_dir, suffix_gt='real_B', suffix_pred='fake_B'):
     gt_list = glob.glob(os.path.join(data_dir, '*{}.png'.format(suffix_gt)))
-
+    # gf_list = glob.glob(os.path.join((data_dir, 'gf')))
+    # pred_list = [ll.replace(suffix_gt, suffix_pred) for ll in gf_list]
     pred_list = [ll.replace(suffix_gt, suffix_pred) for ll in gt_list]
     # for gt, pred in zip(gt_list, pred_list):
     #     print(gt)
@@ -32,6 +32,7 @@ def get_image_pairs(data_dir, suffix_gt='real_B', suffix_pred='fake_B'):
         pred_imgs.append(pred_img)
         gt_imgs.append(imread(gt_path, thresh=127))
 
+
     save_folder = 'save_folder'
 
     if not os.path.exists(save_folder):
@@ -40,7 +41,6 @@ def get_image_pairs(data_dir, suffix_gt='real_B', suffix_pred='fake_B'):
     for i, (src_img, tgt_img) in enumerate(zip(pred_imgs, gt_imgs)):
         save_path_src = os.path.join(save_folder, f'src_image_{i}.png')
         save_path_tgt = os.path.join(save_folder, f'tgt_image_{i}.png')
-
         cv2.imwrite(save_path_src, src_img)
         cv2.imwrite(save_path_tgt, tgt_img)
 

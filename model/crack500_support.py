@@ -11,6 +11,16 @@ import math as mat
 import torch
 from itertools import combinations
 import pydicom
+import img_quality_metrics as img_qm
+from scipy.stats import spearmanr
+from scipy.stats import kendalltau
+from scipy.stats import pearsonr
+from scipy.signal import convolve2d
+import self_imq_implement_support as imq_spt
+from scipy.optimize import curve_fit
+from sklearn.metrics import mean_squared_error
+from scipy.cluster.vq import kmeans, whiten, vq
+import phasepack as pc
 
 R_FACTOR = 0.2999
 G_FACTOR = 0.587
@@ -91,7 +101,7 @@ SEG_FLAT_UPPER_BOUND_RATIO = 0.9
 SEG_RECT_TRANSPOSE = True
 SEG_RECT_NO_TRANSPOSE = False
 SEG_CIRCLE_DELTA_THETA = 0.1
-DISTANCE_SEG_NUM =14#4#9#17#20#100#60#50#15#30#100
+DISTANCE_SEG_NUM =8#4#9#17#20#100#60#50#15#30#100
 DISTANCE_SEG_MAX_INTENSITY = 1#1
 DISTANCE_SEG_MIN_INTENSITY = 0.01#0.01
 INTENSITY_STEP_VAL = 0.06
@@ -239,6 +249,27 @@ SQUARE_GRATING_CYCLE_NUM = 2
 SQUARE_GRATING_HALF_CYCLE_WIDTH = 3
 IMG_GRAY_DIM_HORIZONTAL = 0
 IMG_GRAY_DIM_VERTICAL = 1
+CONT_THRESH_ILLUSION_HOR_LEFT = 0
+CONT_THRESH_ILLUSION_HOR_RIGHT = 1
+CONT_THRESH_ILLUSION_VER_TOP = 0
+CONT_THRESH_ILLUSION_VER_BOTTOM = 1
+CONT_THRESH_ILLUSION_HOR = 0
+CONT_THRESH_ILLUSION_VER = 1
+SQUARE_GRATING_CONST_VAL_IDX = 4
+SQUARE_GRATING_CONST_AVG = 0
+SQUARE_GRATING_CONST_LOWEST = 1
+MOS_SIM_METRIC_FSIM_IDX = 0
+MOS_SIM_METRIC_SSIM_IDX = 1
+MOS_SIM_METRIC_HFSIM_IDX = 2
+MOS_SIM_METRIC_HSMSIM_IDX = 3
+
+
+def nan_proc_replace(val, replace_val=0):
+    if np.isnan(val):
+        val_res = replace_val
+    else:
+        val_res = val
+    return val_res
 
 
 def load_img_training_data(img_train_file_root, img_label_file_root, train_img_file_name_pref, label_img_file_name_pref, img_file_num):
@@ -262,11 +293,27 @@ def load_img_data(img_file_root, img_file_name_pref, img_file_num):
     return img_list
 
 
-def img_gray_resize(img, resize_ratio,  interpolation = cv2.INTER_NEAREST):
+def img_gray_resize(img, resize_ratio,  interpolation=cv2.INTER_NEAREST):
     img_shape = img.shape
     new_row = np.int_(np.ceil(img_shape[1]*resize_ratio))
     new_col = np.int_(np.ceil(img_shape[0]*resize_ratio))
-    img_resized = cv2.resize(img, (new_row, new_col), interpolation)
+    img_resized = np.round(cv2.resize(img, (new_row, new_col), interpolation), 0)
+    return img_resized
+
+
+def img_gray_resize_dim_wise(img, resize_ratio_col,  resize_ratio_row, interpolation=cv2.INTER_NEAREST):
+    img_shape = img.shape
+    new_row = np.int_(np.ceil(img_shape[1]*resize_ratio_col))
+    new_col = np.int_(np.ceil(img_shape[0]*resize_ratio_row))
+    img_resized = np.round(cv2.resize(img, (new_row, new_col), interpolation), 0)
+    return img_resized
+
+
+def img_gray_resize_dim_wise_spec(img, resize_col,  resize_row, interpolation=cv2.INTER_NEAREST):
+    img_shape = img.shape
+    #new_row = np.int_(np.ceil(img_shape[1]*resize_ratio_col))
+    #new_col = np.int_(np.ceil(img_shape[0]*resize_ratio_row))
+    img_resized = np.round(cv2.resize(img, (resize_row, resize_col), interpolation), 0)
     return img_resized
 
 
@@ -544,6 +591,17 @@ def extract_img_objects(img_file_path):
     img_list = pik.load(img_list_file)
     img_list_file.close()
     return img_list
+
+
+def init_list_storage_map(key_list):
+    key_num = len(key_list)
+    map_result = dict()
+    i = 0
+    while i < key_num:
+        key = key_list[i]
+        map_result[key] = []
+        i += 1
+    return map_result
 
 
 def replace_file_extension(file_name, file_ext_list):
@@ -995,9 +1053,9 @@ def save_gray_image(img_gray, file_path_name, is_source_normalized=True):
     #img_gray = np.expand_dims(img, axis=2)
     #img_bgr = cv2.cvtColor(img_gray, cv2.COLOR_GRAY2BGR)
     if is_source_normalized:
-        img_gray = np.int_(img_gray*255)
+        img_gray = np.round(img_gray*255, 0)
     cv2.imwrite(file_path_name, img_gray)
-    return
+    return img_gray
 
 
 def render_img_gray_seg_to_bc_shape(img, seg_start, seg_direction, seg_mod_start, seg_mod_range, scan_direction, render_direction, bc_shape, is_img_copy=SEG_IMG_COPY):
@@ -4217,7 +4275,7 @@ def img_segmentation_threshold_list_light(img, threshold_list):
     current_seg_residual = np.round(img, IMAGE_ROUND_PRECISION)
     threshold_list = np.round(np.array(threshold_list), IMAGE_ROUND_PRECISION)
     e_time_seg = tm.time()
-    print("round:", e_time_seg - s_time_seg, "s")
+    #print("round:", e_time_seg - s_time_seg, "s")
     i = 0
     while i < threshold_num:
         #img_current_threshold
@@ -4250,16 +4308,22 @@ def img_unique_value_count(img_int, unique_value):
     return unique_value_count
 
 
-def img_whole_range_unique_value_count(img):
+def img_whole_range_unique_value_count(img, is_normalize=False):
     img_int = np.int_(np.around(img * INT_GRAY_LEVEL_BAR))
     img_intensity_max = np.max(img_int)
     img_intensity_min = np.min(img_int)
     img_whole_range_unique_value_count_list = []
     img_whole_range_unique_value_scale = range(img_intensity_min, img_intensity_max+1)
     for i in img_whole_range_unique_value_scale:
-        unique_value_count = img_unique_value_count(img_int, i)
-        img_whole_range_unique_value_count_list.append(unique_value_count)
+        if i >= 0:
+            unique_value_count = img_unique_value_count(img_int, i)
+            img_whole_range_unique_value_count_list.append(unique_value_count)
     img_whole_range_unique_value_count_list = np.array(img_whole_range_unique_value_count_list)
+    if is_normalize:
+        img_whole_range_unique_value_count_list = img_whole_range_unique_value_count_list/np.sum(img_whole_range_unique_value_count_list)
+    if img_whole_range_unique_value_scale[0] < 0:
+        value_len = len(img_whole_range_unique_value_scale)
+        img_whole_range_unique_value_scale = img_whole_range_unique_value_scale[1:value_len]
     return np.int_(np.array(list(img_whole_range_unique_value_scale))), img_whole_range_unique_value_count_list#/np.max(img_whole_range_unique_value_count_list)
 
 
@@ -4626,14 +4690,13 @@ def img_integer_segmentation_equal_range_thresholds(img, seg_num, is_segment_mod
 
 
 def img_integer_segmentation_equal_range_thresholds_light(img, seg_num, is_segment_mod=False):
-    img_max = np.max(img)
+    img_max = np.amax(img)
     img_min = np.min(img)
     img_mini_idx_ref = np.int_(img_min*INT_GRAY_LEVEL_BAR)
     img_single_step_value = img_intensity_precision_proc(-IMG_SINGLE_STEP_VALUE_ABS)
     plane_section_num, intensity_plane_num = img_plane_whole_range_section_num(img, seg_num)
     intensity_plane_num = np.int_(intensity_plane_num)
     #img_hist = np.histogram(img, bins=intensity_plane_num)[0]
-
     img_seg_step = (plane_section_num - 1) * img_single_step_value
     threshold_list = []
     threshold_list_with_zero_section = []
@@ -4641,6 +4704,7 @@ def img_integer_segmentation_equal_range_thresholds_light(img, seg_num, is_segme
     threshold_num = seg_num # - 1
     threshold = img_max
     threshold_idx = 1
+
     while (i < threshold_num or is_segment_mod) and threshold_idx > 0:
         #threshold = threshold + img_seg_step
         threshold = img_intensity_precision_proc(threshold + img_seg_step)
@@ -4677,6 +4741,12 @@ def img_threshold_array_div(img_threshold_list, effective_threshold_last):
     return img_threshold_list_div
 
 
+def img_gray_integer_segmentation_equal_range_reconstruction(img_gray, seg_num, is_segment_mod=False):
+   multi_threshold_integer_float,  multi_threshold_integer_int, threshold_list_with_zero, threshold_list_with_zero_int, plane_section_num, effective_threshold_last = img_integer_segmentation_equal_range_thresholds_light(img_gray, seg_num, is_segment_mod)
+   segmentation_img_plane_list = img_segmentation_threshold_list_light(img_gray, multi_threshold_integer_int / 255)
+   img_reconstructed = img_segmentation_reconstruction_threshold(segmentation_img_plane_list, multi_threshold_integer_int / 255)
+   return img_reconstructed
+
 def img_rgb_integer_segmentation_equal_range_thresholds(img_rgb, seg_num, is_segment_mod=False):
     img_red = img_rgb[:, :, IMG_MAP_RED_IDX]
     img_blue = img_rgb[:, :, IMG_MAP_BLUE_IDX]
@@ -4709,6 +4779,7 @@ def img_rgb_integer_segmentation_equal_range_thresholds(img_rgb, seg_num, is_seg
     img_red_reconstructed = np.expand_dims(img_red_reconstructed, 2)
     img_blue_reconstructed = np.expand_dims(img_blue_reconstructed, 2)
     img_green_reconstructed = np.expand_dims(img_green_reconstructed, 2)
+    #img_rgb_reconstructed = np.concatenate((img_red_reconstructed, img_green_reconstructed, img_blue_reconstructed), axis=2)
     img_rgb_reconstructed = np.concatenate((img_red_reconstructed, img_green_reconstructed, img_blue_reconstructed), axis=2)
     return img_rgb_reconstructed
 
@@ -4818,14 +4889,15 @@ def display_img_gray_hist_statistics(img_gray):
     plt.show()
 
 
-def display_img_gray_hist_statistics_comp(img_original, img_reconstructed):
-    img_whole_range_unique_value_scale_org, img_whole_range_unique_value_count_list_org = img_whole_range_unique_value_count(img_original)
-    img_whole_range_unique_value_scale_rec, img_whole_range_unique_value_count_list_rec = img_whole_range_unique_value_count(img_reconstructed)
+def display_img_gray_hist_statistics_comp(img_original, img_reconstructed, is_normalize=False):
+    img_whole_range_unique_value_scale_org, img_whole_range_unique_value_count_list_org = img_whole_range_unique_value_count(img_original, is_normalize)
+    img_whole_range_unique_value_scale_rec, img_whole_range_unique_value_count_list_rec = img_whole_range_unique_value_count(img_reconstructed, is_normalize)
     plt.subplot(1, 2, 1)
     plt.bar(img_whole_range_unique_value_scale_org, img_whole_range_unique_value_count_list_org)
     plt.subplot(1, 2, 2)
     plt.bar(img_whole_range_unique_value_scale_rec, img_whole_range_unique_value_count_list_rec)
     plt.show()
+    return img_whole_range_unique_value_scale_org, img_whole_range_unique_value_count_list_org, img_whole_range_unique_value_scale_rec, img_whole_range_unique_value_count_list_rec
 
 
 def convert_gray_dicom_to_normal_img(dicom_file_path):
@@ -5425,6 +5497,7 @@ def img_gray_avg_pool(img_gray, k_size=(10, 3), sd=(2, 2)):
 
 def generate_fun_grating_img(img_line_num, grating_fun, grating_fun_params):
     scan_line_info = grating_fun(grating_fun_params)
+    #scan_line_info = np.round(scan_line_info, 2)
     scan_line = scan_line_info[0]
     img_col_num = scan_line_info[1]
     img_shape = (img_line_num, img_col_num)
@@ -5438,7 +5511,7 @@ def generate_fun_grating_img(img_line_num, grating_fun, grating_fun_params):
 
 def wrap_sinusodial_grating_fun_param(f, m, theta, l_0, cycle_width, img_width, triangle_fun):
     cycle_num = np.int_(img_width/cycle_width)
-    grating_fun_param = (f, m, theta, l_0, cycle_width, cycle_num, triangle_fun)
+    grating_fun_param = [f, m, theta, l_0, cycle_width, cycle_num, triangle_fun]
     return grating_fun_param
 
 
@@ -5459,9 +5532,10 @@ def generate_sinusodial_scan_line_cycle_fun(fun_param):
     return [scan_line_info[0], all_cycle_len]
 
 
-def wrap_square_grating_fun_param(l_0, v_abs_max, cycle_width, img_width, half_cycle_width):
+
+def wrap_square_grating_fun_param(l_0, v_abs_max, cycle_width, img_width, half_cycle_width, const_value=SQUARE_GRATING_CONST_AVG):
     cycle_num = np.int_(img_width / cycle_width)
-    grating_fun_param = (l_0, v_abs_max, cycle_num, half_cycle_width)
+    grating_fun_param = [l_0, v_abs_max, cycle_num, half_cycle_width, const_value]
     return grating_fun_param
 
 
@@ -5470,25 +5544,47 @@ def generate_square_scan_line(fun_param):
     v_abs_max = fun_param[SQUARE_GRATING_V_ABS_MAX_IDX]
     cycle_num = fun_param[SQUARE_GRATING_CYCLE_NUM]
     half_cycle_width = fun_param[SQUARE_GRATING_HALF_CYCLE_WIDTH]
+    const_val = fun_param[SQUARE_GRATING_CONST_VAL_IDX]
     all_cycle_len = np.int_(2*cycle_num*half_cycle_width)
     scan_line = np.zeros(all_cycle_len)
-    line_value_low = l_0 + v_abs_max
-    line_value_high = line_value_low + 2*v_abs_max
+    if const_val == SQUARE_GRATING_CONST_AVG:
+        line_value_low = l_0 - v_abs_max
+        line_value_high = line_value_low + 2*v_abs_max
+    else:
+        line_value_low = l_0
+        line_value_high = line_value_low + v_abs_max
     line_value_list = [line_value_high, line_value_low]
     i = 0
     while i < all_cycle_len:
         val_index = np.int_(np.int_(i/half_cycle_width) % 2)
         scan_line[i] = line_value_list[val_index]
         i += 1
+    scan_line = np.round(scan_line, 4)
     return [scan_line, all_cycle_len]
 
 
-def opt_result_to_threshold_list(best_x):
+def opt_result_to_threshold_list(best_x, is_img_int=False):
     g_best_x = np.sort(np.round(best_x, 0))[::-1]
     if g_best_x[len(g_best_x) - 1] > 0:
         g_best_x = np.append(g_best_x, 0)
-    threshold_list = g_best_x / 255
+    if is_img_int is not True:
+        threshold_list = g_best_x / 255
+    else:
+        threshold_list = g_best_x
     return threshold_list
+
+
+def img_sim_hist_shape_measure_rgb(img_original, img_reconstruction, multi_threshold_integer_int_list, hist_shape_coef=0.4):
+    i = 0
+    hist_shape_measure = 0
+    while i < 3:
+        img_plane_org = img_original[:, :, i]
+        img_plane_rec = img_reconstruction[:, :, i]
+        threshold_list_int = multi_threshold_integer_int_list[i]
+        hist_shape_measure += img_sim_hist_shape_measure(img_plane_org, img_plane_rec, threshold_list_int, hist_shape_coef)
+        i += 1
+    hist_shape_measure = hist_shape_measure/3
+    return hist_shape_measure
 
 
 def img_sim_hist_shape_measure(img_original, img_reconstruction, threshold_list_int, hist_shape_coef=0.4):
@@ -5575,12 +5671,13 @@ def img_sim_hist_shape_measure_skewness(img_original, img_reconstruction, thresh
     hist_dyna_org = cal_img_dyna(img_original)
     hist_dyna_rec = cal_img_dyna(img_reconstruction)
     hist_dyna_diff_ratio = 1 - np.abs(hist_dyna_org - hist_dyna_rec) / hist_dyna_org
-    hist_shape_measure = hist_skewness_coef * (1- skewness_diff_ratio) + (1 - hist_skewness_coef) * hist_dyna_diff_ratio
+    hist_shape_measure = hist_skewness_coef * (1 - skewness_diff_ratio) + (1 - hist_skewness_coef) * hist_dyna_diff_ratio
     return hist_shape_measure
 
 
-def hist_feature_hybrid_sim(hist_sim, fsim, ssim, hist_sim_ratio=0.4, fsim_ratio=0.2, ssim_ratio=0.4):
+def hist_feature_hybrid_sim(hist_sim, fsim, ssim, hist_sim_ratio=0.1, fsim_ratio=0.9, ssim_ratio=0):#0.3 0.7
     hfsim = hist_sim_ratio*hist_sim + fsim*fsim_ratio + ssim*(1 - fsim_ratio - hist_sim_ratio)
+    #hfsim = hist_sim*fsim
     return hfsim
 
 
@@ -5605,41 +5702,1810 @@ def img_gray_one_dim_fourier_transform(img_gray, array_idx, dim_direction=IMG_GR
     array_fft_abs_ret = np.abs(array_fft_ret)
     return array_fft_ret, array_fft_freq_ret, array_fft_abs_ret
 
-def load_images(dataset):
 
-    image_files = [f for f in os.listdir(dataset) if f.endswith(".jpg") or f.endswith('.png')]
-    # test_image_files = [f for f in os.listdir(test_dataset) if f.endswith(".jpg")]
-
-    # train_image_files.sort(key=extract_numeric_part)
-    # test_image_files.sort(key=extract_numeric_part)
-
-
-    image_paths = sorted([os.path.join(dataset, image) for image in image_files])
-    # test_image_paths = [os.path.join(dataset, test_image) for test_image in test_image_files]
-
-    # image_info = [(os.path.join(dataset, train_image), train_image) for train_image in train_image_files]
-    # test_image_info = [(os.path.join(test_dataset, test_image), test_image) for test_image in test_image_files]
-
-    return image_paths
-
-def load_images_as_tensors(image_paths):
+def draw_illusion_img(central_index_hor, central_index_ver, peri_index_hor_adj, peri_index_ver_adj):
+    illusion_img = np.ones((1000, 1000)) * 115#SAME_SWITCH_ILLU:#100#50#120#115#90#60#30#85 #NO_ILLU:#180#220#160 #TRI_DIFF_ILLU#140
+    illusion_img[central_index_ver[0]:central_index_ver[1], central_index_hor[0]:central_index_hor[1]] = 155#154#151
+    illusion_img[central_index_ver[0]:central_index_ver[1], peri_index_hor_adj[0]:peri_index_hor_adj[1]] = 150#149#147#145#147#180#140#180#152
+    illusion_img[peri_index_ver_adj[0]:peri_index_ver_adj[1], central_index_hor[0]:central_index_hor[1]] = 150#149#147#145#147#180#140#180#152
+    return illusion_img
 
 
-    tensors = []
-    for image_path in image_paths:
-        img = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
-            # Normalize the image data to a range of 0 to 1
-        img = img / 255.0
-        img_tensor = torch.from_numpy(img)
-        thresholded_tensor = (img_tensor > 0.0).float()
-        tensors.append(thresholded_tensor)
-        #tensors.append(img_tensor)
-    return tensors
+def contrast_threshold_illusion_generation(horizontal_direction=CONT_THRESH_ILLUSION_HOR_RIGHT, vertical_direction=CONT_THRESH_ILLUSION_VER_TOP, illusion_direction=CONT_THRESH_ILLUSION_VER):
+    central_index_hor_low = 440
+    central_index_hor_high = 520#480
+    central_index_ver_low = 440
+    central_index_ver_high = 520#480
+    if horizontal_direction == CONT_THRESH_ILLUSION_HOR_LEFT:
+        hor_adj_offset = -1
+    else:
+        hor_adj_offset = 1
+    if vertical_direction == CONT_THRESH_ILLUSION_VER_TOP:
+        ver_adj_offset = -1
+    else:
+        ver_adj_offset = 1
+    peri_index_hor_adj_low = central_index_hor_low + hor_adj_offset*80
+    peri_index_hor_adj_high = central_index_hor_high + hor_adj_offset*80
+    peri_index_ver_adj_low = central_index_hor_low + ver_adj_offset*80
+    peri_index_ver_adj_high = central_index_hor_high + ver_adj_offset*80
+    central_index_hor = (central_index_hor_low, central_index_hor_high)
+    central_index_ver = (central_index_ver_low, central_index_ver_high)
+    peri_index_hor_adj = (peri_index_hor_adj_low, peri_index_hor_adj_high)
+    peri_index_ver_adj = (peri_index_ver_adj_low, peri_index_ver_adj_high)
+    no_illusion_img = draw_illusion_img(central_index_hor, central_index_ver, peri_index_hor_adj, peri_index_ver_adj)
+    if illusion_direction == CONT_THRESH_ILLUSION_HOR:
+        peri_index_hor_adj_low = peri_index_hor_adj_low + hor_adj_offset*20
+        peri_index_hor_adj_high = peri_index_hor_adj_high + hor_adj_offset*20
+        peri_index_hor_adj = (peri_index_hor_adj_low, peri_index_hor_adj_high)
+    else:
+        peri_index_ver_adj_low = peri_index_ver_adj_low + ver_adj_offset*20
+        peri_index_ver_adj_high = peri_index_ver_adj_high + ver_adj_offset*20
+        peri_index_ver_adj = (peri_index_ver_adj_low, peri_index_ver_adj_high)
+    illusion_img = draw_illusion_img(central_index_hor, central_index_ver, peri_index_hor_adj, peri_index_ver_adj)
+    return no_illusion_img, illusion_img
 
-def get_img_name(target_paths):
-    target_name = []
-    for target_paths in target_paths:
-        original_filename = os.path.basename(target_paths)
-        filename_parts = original_filename.split('.')[0]
-        target_name.append(filename_parts)
-    return target_name
+
+def combine_identical_image_ver_format(img_list, img_ver_space=80):
+    img_num = len(img_list)
+    single_img = img_list[0]
+    single_img_shape = single_img.shape
+    img_width = single_img_shape[1]
+    single_img_height = single_img_shape[0]
+    img_height = single_img_height * img_num + img_ver_space * (img_num - 1)
+    combined_img = np.zeros((img_height, img_width))
+    i = 0
+    img_insertion_line = 0
+    while i < img_num:
+        single_img = img_list[i]
+        combined_img[img_insertion_line:img_insertion_line+single_img_height, :] = single_img
+        img_insertion_line += single_img_height
+        img_insertion_line += img_ver_space
+        i += 1
+    return combined_img
+
+
+def generate_gradient_grating_img(img_line_num, grating_fun, grating_fun_params, gradient_step_unit, gradient_step_num, gradient_param_idx):
+    i = 0
+    gradient_img_list = []
+    m = grating_fun_params[gradient_param_idx]
+    while i < gradient_step_num:
+        square_grating_img_info = generate_fun_grating_img(img_line_num, grating_fun, grating_fun_params)
+        square_grating_img = square_grating_img_info[0]
+        gradient_img_list.append(square_grating_img)
+        m += gradient_step_unit
+        grating_fun_params[gradient_param_idx] = m
+        i += 1
+    combined_gradient_img = combine_identical_image_ver_format(gradient_img_list)
+    return gradient_img_list, combined_gradient_img
+
+
+def img_rgb_hist_sample(img, hist_threshold):
+    multi_threshold_integer_int_list = []
+    img_sampled = []
+    i = 0
+    while i < 3:
+        img_plane = img[:, :, i]
+        img_gray_distorted_filled, multi_threshold_integer_int = img_gray_hist_sample(img_plane, hist_threshold)
+        multi_threshold_integer_int_list.append(multi_threshold_integer_int)
+        img_gray_distorted_filled = np.expand_dims(img_gray_distorted_filled, 2)
+        img_sampled.append(img_gray_distorted_filled)
+        i += 1
+    #multi_threshold_integer_int_list = np.array(multi_threshold_integer_int_list)
+    img_sampled = np.concatenate((img_sampled[0], img_sampled[1], img_sampled[2]), axis=2)
+    return img_sampled, multi_threshold_integer_int_list
+
+
+def img_gray_hist_sample(img, hist_threshold):
+    img_whole_range_unique_value_scale_rec, img_whole_range_unique_value_count_list_rec = img_whole_range_unique_value_count(img)
+    img_whole_range_unique_value_count_list_rec = img_whole_range_unique_value_count_list_rec / np.max(img_whole_range_unique_value_count_list_rec)
+    multi_threshold_integer_int = np.where(img_whole_range_unique_value_count_list_rec > hist_threshold)[0]
+    multi_threshold_index_zero = np.where(img_whole_range_unique_value_count_list_rec <= hist_threshold)[0]
+    multi_threshold_index_zero = np.round(multi_threshold_index_zero + np.min(img) * 255, 0)
+    img_gray_distorted_filled = img_gray_fill_zeros(np.round(img * 255, 0), multi_threshold_index_zero)
+    img_gray_distorted_filled = img_gray_distorted_filled / INT_GRAY_LEVEL_BAR
+    return img_gray_distorted_filled, multi_threshold_integer_int
+
+
+def img_gray_fill_zeros(img, zero_values):
+    img_ret = img_copy(img)
+    zero_value_len = zero_values.size
+    i = 0
+    while i < zero_value_len:
+        img_ret[img_ret == zero_values[i]] = -1
+        i += 1
+    return img_ret
+
+
+def img_hfsim_cal(img_org, img_rec, hist_threshold, is_rgb=False):
+    if is_rgb:
+        img_sampled, multi_threshold_integer_int_list = img_rgb_hist_sample(img_rec, hist_threshold)
+        hist_shape_measure = img_sim_hist_shape_measure_rgb(img_org, img_sampled, multi_threshold_integer_int_list)
+    else:
+        img_gray_distorted_filled, multi_threshold_integer_int = img_gray_hist_sample(img_rec, hist_threshold)
+        hist_shape_measure = img_sim_hist_shape_measure(img_org, img_gray_distorted_filled, multi_threshold_integer_int)
+    #fsim = img_qm.fsim(np.round(img_org * 255, 0).astype(np.uint8), np.round(img_rec * 255).astype(np.uint8))
+    fsim = imq_spt.fsim(np.round(img_org * 255, 0).astype(np.uint8), np.round(img_rec * 255).astype(np.uint8))
+    ssim = img_qm.ssim(np.round(img_org * 255, 0).astype(np.uint8), np.round(img_rec * 255, 0).astype(np.uint8), max_p=255)
+    hfsim = hist_feature_hybrid_sim(hist_shape_measure, fsim, ssim)
+    return hfsim, fsim, ssim, hist_shape_measure
+
+
+def get_txt_file_float_lines(file_path):
+    lines = get_txt_file_str_lines(file_path)
+    line_num = len(lines)
+    float_lines = []
+    i = 0
+    while i < line_num:
+        float_lines.append(float(lines[i]))
+        i += 1
+    return np.array(float_lines)
+
+
+def retrieve_mos_info(mos_file_path, name_score_spliter=' '):
+    mos_lines = get_txt_file_str_lines(mos_file_path)
+    mos_line_num = len(mos_lines)
+    score_list = []
+    name_list = []
+    i = 0
+    while i < mos_line_num:
+        mos_line = mos_lines[i]
+        mos_info = mos_line.split(name_score_spliter)
+        score_list.append(float(mos_info[0]))
+        name_list.append(mos_info[1])
+        i += 1
+    scores = np.array(score_list)
+    return scores, name_list
+
+
+def retrieve_file_paths(ref_file_path):
+    file_name_list = os.listdir(ref_file_path)
+    file_path_list = []
+    for entry in file_name_list:
+        file_path = os.path.join(ref_file_path, entry)
+        file_path_list.append(file_path)
+    return file_path_list, file_name_list
+
+
+def retrieve_mos_raw_images(file_path_list, is_rgb=True, img_map_idx=IMG_MAP_GRAY_IDX, is_img_int=False):
+    file_path_list_len = len(file_path_list)
+    raw_image_list = []
+    i = 0
+    while i < file_path_list_len:
+        file_path = file_path_list[i]
+        if is_rgb:
+            raw_image = get_rgb_img_from_file(file_path)/INT_GRAY_LEVEL_BAR
+        else:
+            raw_image = get_gray_img_from_file(file_path, img_map_idx=img_map_idx)
+        if is_img_int:
+            raw_image = np.round(raw_image*INT_GRAY_LEVEL_BAR, 0)
+        raw_image_list.append(raw_image)
+        i += 1
+    return raw_image_list
+
+
+def resize_mos_images(raw_mos_images, resize_ratio=0.5, interpolation=cv2.INTER_NEAREST):
+    image_num = len(raw_mos_images)
+    resized_images = []
+    i = 0
+    while i < image_num:
+        raw_image = raw_mos_images[i]
+        resized_image = img_gray_resize(np.round(raw_image*INT_GRAY_LEVEL_BAR, 0), resize_ratio, interpolation=interpolation)/INT_GRAY_LEVEL_BAR
+        resized_images.append(resized_image)
+        i += 1
+    return resized_images
+
+
+def resize_mos_images_down_sample(raw_mos_images, is_rgb=True, resize_const=256):
+    image_num = len(raw_mos_images)
+    resized_images = []
+    i = 0
+    while i < image_num:
+        raw_image = raw_mos_images[i]
+        resized_image = img_down_sample_resize(np.round(raw_image*INT_GRAY_LEVEL_BAR, 0), resize_const, is_rgb)
+        resized_image = resized_image/INT_GRAY_LEVEL_BAR
+        resized_images.append(resized_image)
+        i += 1
+    return resized_images
+
+
+def mos_images_equal_range_segmentation_reconstruction(mos_images, seg_num, is_segment_mod, is_rgb=True):
+    image_num = len(mos_images)
+    reconstructed_images = []
+    i = 0
+    while i < image_num:
+        mos_image = mos_images[i]
+        if is_rgb:
+            seg_rec_mos_image = img_rgb_integer_segmentation_equal_range_thresholds(mos_image, seg_num, is_segment_mod=is_segment_mod)
+        else:
+            seg_rec_mos_image = img_gray_integer_segmentation_equal_range_reconstruction(mos_image, seg_num, is_segment_mod=is_segment_mod)
+        reconstructed_images.append(seg_rec_mos_image)
+        i += 1
+    return reconstructed_images
+
+
+def generate_mos_ref_file_map(mos_images, mos_image_names):
+    image_num = len(mos_images)
+    ref_image_map = dict()
+    i = 0
+    while i < image_num:
+        mos_image_name = mos_image_names[i]
+        mos_key = mos_image_name.split('.')
+        mos_key = mos_key[0].upper()
+        mos_image = mos_images[i]
+        ref_image_map[mos_key] = mos_image
+        i += 1
+    return ref_image_map
+
+
+def generate_mos_file_paths(mos_file_names, root_path):
+    file_name_num = len(mos_file_names)
+    mos_file_paths = []
+    i = 0
+    while i < file_name_num:
+        mos_file_name = mos_file_names[i]
+        file_path = os.path.join(root_path, mos_file_name)
+        mos_file_paths.append(file_path)
+        i += 1
+    return mos_file_paths
+
+
+def cal_mos_sim_scores(ref_image_map, dist_image_list, dist_image_name_list, hist_threshold, dist_image_name_spliter='_', is_rgb=True):
+    dist_image_num = len(dist_image_list)
+    fsims = []
+    ssims = []
+    hfsims = []
+    hsmsims = []
+    i = 0
+    while i < dist_image_num:
+        dist_image_name = dist_image_name_list[i]
+        ref_key = dist_image_name.split(dist_image_name_spliter)[0]
+        ref_key = ref_key.upper()
+        ref_image = ref_image_map[ref_key]
+        dist_image = dist_image_list[i]
+        hfsim, fsim, ssim, hist_shape_measure = img_hfsim_cal(ref_image, dist_image, hist_threshold, is_rgb)
+        fsims.append(fsim)
+        ssims.append(ssim)
+        hfsims.append(hfsim)
+        hsmsims.append(hist_shape_measure)
+        i += 1
+        print("image completed:", i, dist_image_name, ref_key, " fsim:", fsim, " hfsim:", hfsim)
+    fsims = np.array(fsims)
+    ssims = np.array(ssims)
+    hfsims = np.array(hfsims)
+    hsmsims = np.array(hsmsims)
+    return fsims, ssims, hfsims, hsmsims
+
+
+def cal_mos_sim_metric_performance_score(mos_scores, mos_sim_metric_scores, is_regression=True):
+    mos_order = get_index_array_one_dim(np.argsort(mos_scores))
+    ssim_order = get_index_array_one_dim(np.argsort(mos_sim_metric_scores))
+    #test
+    sim_order_sub = np.abs(mos_order - ssim_order)
+    sim_order_sub_max = np.argmax(sim_order_sub)
+    print("sim order sum max arg:", sim_order_sub_max)
+    #test end
+    spear_corr, spear_pval = spearmanr(mos_order, ssim_order)
+    kend_corr, kend_pval = kendalltau(mos_order, ssim_order)
+    if is_regression:
+        mos_sim_regression_scores = mos_sim_score_none_linear_regression_score(mos_scores, mos_sim_metric_scores)
+        pearson_corr, pearson_pval = pearsonr(mos_scores, mos_sim_regression_scores)
+        mos_sim_regression_rmse = mean_squared_error(mos_scores, mos_sim_regression_scores)
+        mos_sim_regression_rmse = np.sqrt(mos_sim_regression_rmse)
+    else:
+        pearson_corr = np.nan
+        mos_sim_regression_rmse = np.nan
+    return spear_corr, kend_corr, pearson_corr, mos_sim_regression_rmse
+
+
+def get_txt_file_str_lines(file_path):
+    txt_file = open(file_path, "r", newline='')
+    line_list = []
+    while True:
+        line = txt_file.readline()
+        if not line:
+            break
+        if line[len(line) - 2] == '\r':
+            line = line[0:len(line) - 2]
+        line_list.append(line)
+    txt_file.close()
+    return line_list
+
+
+def get_index_array_one_dim(source_array):
+    array_len = source_array.size
+    index_array = np.int_(np.zeros(array_len))
+    i = 0
+    while i < array_len:
+        index_array[source_array[i]] = i
+        i += 1
+    return index_array
+
+
+def img_down_sample_resize(img, resize_const=256, is_rgb=True):
+    if is_rgb:
+        img_resized = img_rgb_down_sample_resize(img, resize_const)
+    else:
+        img_resized = img_gray_down_sample_resize(img, resize_const)
+    return img_resized
+
+
+def img_rgb_down_sample_resize(img_rgb, resize_const=256):
+    img_0_resized = img_gray_down_sample_resize(img_rgb[:, :, 0], resize_const)
+    img_1_resized = img_gray_down_sample_resize(img_rgb[:, :, 1], resize_const)
+    img_2_resized = img_gray_down_sample_resize(img_rgb[:, :, 2], resize_const)
+    img_0_resized = np.expand_dims(img_0_resized, 2)
+    img_1_resized = np.expand_dims(img_1_resized, 2)
+    img_2_resized = np.expand_dims(img_2_resized, 2)
+    img_resized = np.concatenate((img_0_resized, img_1_resized, img_2_resized), axis=2)
+    return img_resized
+
+
+def img_gray_down_sample_resize(img_gray, resize_const=256):
+    img_shape = img_gray.shape
+    row_num = img_shape[0]
+    col_num = img_shape[1]
+    min_dim = np.fmin(row_num, col_num)
+    resize_factor = np.int_(np.fmax(1, np.round(min_dim / resize_const)))
+    core = np.full((resize_factor, resize_factor), np.power(1 / resize_factor, 2))
+    resized_img_gray = convolve2d(img_gray, core, mode='same')
+    resized_img_gray = resized_img_gray[0:row_num:resize_factor, 0:col_num:resize_factor]
+    resized_img_gray = np.round(resized_img_gray, 0)
+    return resized_img_gray
+
+
+def img_planes_density_convolve_sum(img_plane_list, kernel_size=(3, 3), kernel_threshold=7):
+    plane_num = len(img_plane_list)
+    img_plane_shape = img_plane_list[0].shape
+    img_plane_sum = np.zeros(img_plane_shape)
+    simple_kernel = np.ones(kernel_size)
+    i = 0
+    while i < plane_num:
+        img_plane = img_plane_list[i]
+        img_plane = convolve2d(img_plane, simple_kernel, mode='same')
+        #plt.hist(img_plane.flatten())
+        #plt.show()
+        hist, bin_edges = np.histogram(img_plane.flatten())
+        hist_last_idx = hist.size - 1
+        if np.argmax(hist) != 0:#hist_last_idx:
+            kernel_threshold = 10
+            img_plane = np.where(img_plane == 10, 1, 0)
+        else:
+            kernel_threshold = 2#bin_edges[hist_last_idx - 1]
+            img_plane = np.where(img_plane >= kernel_threshold, 1, 0)
+        img_plane_sum = img_plane_sum + img_plane
+        i += 1
+    img_plane_sum = np.where(img_plane_sum > 0, 1, 0)
+    img_plane_sum_neg = np.where(img_plane_sum > 0, 0, 1)
+    return img_plane_sum, img_plane_sum_neg
+
+
+def extract_img_gray_plane_convolved_sum(img_gray, seg_num, is_segment_mod, kernel_size=(3, 3), kernel_threshold=7):
+    multi_threshold_integer_float, multi_threshold_integer_int, threshold_list_with_zero, threshold_list_with_zero_int, plane_section_num, effective_threshold_last = img_integer_segmentation_equal_range_thresholds_light(img_gray, seg_num, is_segment_mod)
+    segmentation_img_plane_list = img_segmentation_threshold_list_light(img_gray, multi_threshold_integer_int / INT_GRAY_LEVEL_BAR)
+    img_plane_sum, img_plane_sum_neg = img_planes_density_convolve_sum(segmentation_img_plane_list, kernel_threshold=kernel_threshold, kernel_size=kernel_size)
+    return img_plane_sum, img_plane_sum_neg
+
+
+def display_img_plane_histogram(img_plane_list, kernel_size=(3, 3), seg_num=32, plane_black_white_coef=3.0, is_diplay_hist=True):
+    plane_num = len(img_plane_list)
+    img_plane_shape = img_plane_list[0].shape
+    #img_plane_sum = np.zeros(img_plane_shape)
+    simple_kernel = np.ones(kernel_size)
+    img_plane_sum = np.zeros((img_plane_shape[0] - 2, img_plane_shape[1] - 2))
+    img_plane_sum_w = np.zeros((img_plane_shape[0] - 2, img_plane_shape[1] - 2))
+    i = 0
+    black_white_split = plane_black_white_coef/seg_num
+    plt_num = plane_num * 2
+    while i < plane_num:
+        img_plane = img_plane_list[i]
+        img_plane_conv = convolve2d(img_plane, simple_kernel, mode='valid')
+        #img_plane_conv_th = np.where(img_plane_conv <= 9, img_plane_conv, 0)
+        #img_plane_conv_th = np.where(img_plane_conv_th >= 1, 1, 0)
+
+        #img_plane_conv = convolve2d(img_plane_conv_th, simple_kernel, mode='valid')
+        #img_plane_conv_th = np.where(img_plane_conv <= 9, img_plane_conv, 0)
+        #img_plane_conv_th = np.where(img_plane_conv_th >= 5, 1, 0)
+        #img_plane_conv_th = convolve2d(img_plane_conv_th, simple_kernel, mode='full')
+        #img_plane_conv_th = np.where(img_plane_conv_th <= 6, img_plane_conv_th, 0)
+        #img_plane_conv_th = np.where(img_plane_conv_th >= 3, 1, 0)
+        hist, bin_edges = np.histogram(img_plane_conv.flatten())
+        none_zero_hist_ratio, none_zero_hist_std_diff = img_gray_conv_hist_none_zero_statistics(hist)
+        img_plane_conv_th = img_plane_none_zero_hist_std_diff_select_func(img_plane_conv, none_zero_hist_std_diff)
+        if none_zero_hist_ratio < black_white_split:
+            img_plane_sum = img_plane_sum + img_plane_conv_th
+        else:
+            img_plane_sum_w = img_plane_sum_w + img_plane_conv_th
+        if is_diplay_hist:
+            plt.subplot(2, plane_num, i+1)
+            plt.imshow(img_plane_conv_th, cmap='gray', vmin=0, vmax=1)
+            plt.subplot(2, plane_num, i+1+plane_num)
+            plt.hist(img_plane_conv)
+        i += 1
+    if is_diplay_hist:
+        plt.show()
+    img_plane_sum_neg = np.where(img_plane_sum > 0, 0, 1)
+    img_plane_sum_w_neg = np.where(img_plane_sum_w > 0, 0, 1)
+    plt.subplot(2, 2, 1)
+    plt.imshow(img_plane_sum, cmap='gray', vmin=0, vmax=1)
+    plt.subplot(2, 2, 2)
+    plt.imshow(img_plane_sum_neg, cmap='gray', vmin=0, vmax=1)
+    plt.subplot(2, 2, 3)
+    plt.imshow(img_plane_sum_w, cmap='gray', vmin=0, vmax=1)
+    plt.subplot(2, 2, 4)
+    plt.imshow(img_plane_sum_w_neg, cmap='gray', vmin=0, vmax=1)
+    plt.show()
+    plt.imshow(img_plane_sum*img_plane_sum_w, cmap='gray', vmin=0, vmax=1)
+    plt.show()
+    return
+
+
+def display_img_gray_plane_histogram(img_gray, seg_num, is_segment_mod, kernel_size=(3, 3)):
+    multi_threshold_integer_float, multi_threshold_integer_int, threshold_list_with_zero, threshold_list_with_zero_int, plane_section_num, effective_threshold_last = img_integer_segmentation_equal_range_thresholds_light(img_gray, seg_num, is_segment_mod)
+    segmentation_img_plane_list = img_segmentation_threshold_list_light(img_gray, multi_threshold_integer_int / INT_GRAY_LEVEL_BAR)
+    display_img_plane_histogram(segmentation_img_plane_list, kernel_size, seg_num=seg_num, plane_black_white_coef=3.25, is_diplay_hist=False)#plane_black_white_coef=3.25
+    return
+
+
+def img_gray_conv_hist_none_zero_statistics(conv_hist):
+    hist_size = conv_hist.size
+    none_zero_hist = conv_hist[1:hist_size]
+    img_gray_none_zero_sum = np.sum(none_zero_hist)#img_gray_size - conv_hist[0]
+    none_zero_hist_mean = np.mean(none_zero_hist)
+    none_zero_hist_std = np.std(none_zero_hist)
+    none_zero_hist_std_diff = np.abs(none_zero_hist - none_zero_hist_mean)/none_zero_hist_std
+    hist_sum = np.sum(conv_hist)
+    none_zero_hist_ratio = img_gray_none_zero_sum / hist_sum
+    #print("std diff:", none_zero_hist_std_diff)
+    #print("hist ratio:", none_zero_hist_ratio)
+    return none_zero_hist_ratio, none_zero_hist_std_diff
+
+
+def filter_none_zero_hist_std_diff(none_zero_hist_std_diff, std_diff_threshold=2.0):
+    filtered_diff_index_list = np.argwhere(none_zero_hist_std_diff < std_diff_threshold)
+    filtered_diff_index_list = filtered_diff_index_list + 1
+    return filtered_diff_index_list
+
+
+def img_plane_none_zero_hist_std_diff_select_func(img_plane, none_zero_hist_std_diff, std_diff_threshold=2):
+    filter_list = filter_none_zero_hist_std_diff(none_zero_hist_std_diff, std_diff_threshold)
+    list_size = filter_list.size
+    i = 0
+    while i < list_size:
+        select_value = filter_list[i]
+        img_plane = np.where(img_plane == select_value, -1, img_plane)
+        i += 1
+    img_plane = np.where(img_plane < 0, 1, 0)
+    return img_plane
+
+
+def get_img_gray_plane_list_sum(img_plane_list, kernel_size=(3, 3), seg_num=32, plane_black_white_coef=5.0, conv_mode='valid'):
+    plane_num = len(img_plane_list)
+    img_plane_shape = img_plane_list[0].shape
+    simple_kernel = np.ones(kernel_size)
+    img_plane_sum_b = np.zeros((img_plane_shape[0], img_plane_shape[1]))
+    img_plane_sum_w = np.zeros((img_plane_shape[0], img_plane_shape[1]))
+    i = 0
+    black_white_split = plane_black_white_coef / seg_num
+    while i < plane_num:
+        img_plane = img_plane_list[i]
+        img_plane_conv = convolve2d(img_plane, simple_kernel, mode=conv_mode)
+        hist, bin_edges = np.histogram(img_plane_conv.flatten())
+        none_zero_hist_ratio, none_zero_hist_std_diff = img_gray_conv_hist_none_zero_statistics(hist)
+        img_plane_conv_th = img_plane_none_zero_hist_std_diff_select_func(img_plane_conv, none_zero_hist_std_diff)
+        if none_zero_hist_ratio < black_white_split:
+            img_plane_sum_b = img_plane_sum_b + img_plane_conv_th
+        else:
+            img_plane_sum_w = img_plane_sum_w + img_plane_conv_th
+        i += 1
+    img_plane_sum_b = np.where(img_plane_sum_b > 0, 1, 0)
+    img_plane_sum_w = np.where(img_plane_sum_w > 1, 1, 0)
+    img_plane_sum_b_neg = np.where(img_plane_sum_b > 0, 0, 1)
+    img_plane_sum_w_neg = np.where(img_plane_sum_w > 0, 0, 1)
+    if np.max(img_plane_sum_w) == 1:
+        img_plane_sum_mul = img_plane_sum_b * img_plane_sum_w
+    else:
+        img_plane_sum_mul = img_plane_sum_b
+    return img_plane_sum_b, img_plane_sum_b_neg, img_plane_sum_w, img_plane_sum_w_neg, img_plane_sum_mul
+
+
+def img_gray_planes_sum(img_gray, seg_num, is_segment_mod, kernel_size=(3, 3), plane_black_white_coef=5.0, conv_mode='valid'):
+    multi_threshold_integer_float, multi_threshold_integer_int, threshold_list_with_zero, threshold_list_with_zero_int, plane_section_num, effective_threshold_last = img_integer_segmentation_equal_range_thresholds_light(img_gray, seg_num, is_segment_mod)
+    img_plane_list = img_segmentation_threshold_list_light(img_gray, multi_threshold_integer_int / INT_GRAY_LEVEL_BAR)
+    img_plane_sum_b, img_plane_sum_b_neg, img_plane_sum_w, img_plane_sum_w_neg, img_plane_sum_mul = get_img_gray_plane_list_sum(img_plane_list, kernel_size=kernel_size, seg_num=seg_num, plane_black_white_coef=plane_black_white_coef, conv_mode=conv_mode)
+    return img_plane_sum_b, img_plane_sum_b_neg, img_plane_sum_w, img_plane_sum_w_neg, img_plane_sum_mul
+
+
+def img_gray_plane_sum_sim(img_gray_1, img_gray_2, seg_num, is_segment_mod, kernel_size=(3, 3), plane_black_white_coef=3.0, conv_mode='valid'):
+    img_plane_sum_b_1, img_plane_sum_b_neg_1, img_plane_sum_w_1, img_plane_sum_w_neg_1, img_plane_sum_mul_1 = img_gray_planes_sum(img_gray_1, seg_num=seg_num, is_segment_mod=is_segment_mod, kernel_size=kernel_size, plane_black_white_coef=plane_black_white_coef, conv_mode=conv_mode)
+    img_plane_sum_b_2, img_plane_sum_b_neg_2, img_plane_sum_w_2, img_plane_sum_w_neg_2, img_plane_sum_mul_2 = img_gray_planes_sum(img_gray_2, seg_num=seg_num, is_segment_mod=is_segment_mod, kernel_size=kernel_size, plane_black_white_coef=plane_black_white_coef, conv_mode=conv_mode)
+
+    img_plane_sum_b_sub = np.abs(img_plane_sum_mul_1 - img_plane_sum_mul_2)
+    plt.subplot(2, 2, 1)
+    plt.imshow(img_plane_sum_b_1+img_plane_sum_w_1, cmap='gray', vmin=0, vmax=1)
+    plt.subplot(2, 2, 2)
+    plt.imshow(img_plane_sum_b_2+img_plane_sum_w_2, cmap='gray', vmin=0, vmax=1)
+    plt.subplot(2, 2, 3)
+    plt.imshow(np.where(img_plane_sum_w_1+img_plane_sum_w_2+img_plane_sum_b_1+img_plane_sum_b_2 > 0, 1, 0), cmap='gray', vmin=0, vmax=1)
+    plt.subplot(2, 2, 4)
+    plt.imshow(np.where(img_plane_sum_w_1+img_plane_sum_w_2>0, 1, 0), cmap='gray', vmin=0, vmax=1)
+    plt.show()
+    m_test = np.sum(img_plane_sum_mul_1*img_plane_sum_mul_2)/np.sum(np.where(img_plane_sum_mul_1+img_plane_sum_mul_2 > 0, 1, 0))
+    print(m_test)
+
+    img_plane_sum_b_sub = np.mean(img_plane_sum_b_sub)
+
+    #img_plane_sum_w_sub = np.abs(img_plane_sum_w_1 - img_plane_sum_w_2)
+    img_plane_sum_sub = img_plane_sum_b_sub#(np.mean(img_plane_sum_b_sub) + np.mean(img_plane_sum_w_sub))/2
+    img_plane_sum_sim_measure = 1-img_plane_sum_sub
+    return img_plane_sum_sim_measure
+
+
+def cal_mos_plane_sum_sim_scores_gray(ref_image_map, dist_image_list, dist_image_name_list, seg_num, is_segment_mod, C=0.1, is_rgb=False, kernel_size=(3, 3), plane_black_white_coef=3.0, conv_mode='valid', dist_image_name_spliter='_'):
+    dist_image_num = len(dist_image_list)
+    plane_sum_sims = []
+    i = 0
+    while i < dist_image_num:
+        dist_image_name = dist_image_name_list[i]
+        ref_key = dist_image_name.split(dist_image_name_spliter)[0]
+        ref_key = ref_key.upper()
+        ref_image = ref_image_map[ref_key]
+        dist_image = dist_image_list[i]
+        #img_plane_sum_sim_measure = img_gray_plane_sum_sim(ref_image, dist_image, seg_num=seg_num, is_segment_mod=is_segment_mod, kernel_size=kernel_size, plane_black_white_coef=plane_black_white_coef, conv_mode=conv_mode)
+
+        if is_rgb:
+            ref_image_gray = img_rgb_to_gray_array_cal(np.round(ref_image * 255, 0))
+            dist_image_gray = img_rgb_to_gray_array_cal(np.round(dist_image * 255, 0))
+        else:
+            ref_image_gray = ref_image
+            dist_image_gray = dist_image
+
+        img_plane_sum_sim_measure, img_plane_comp_metric_list = get_img_gray_planes_sim(ref_image_gray, dist_image_gray, seg_num=seg_num, is_segment_mod=is_segment_mod)
+        FSIMc = imq_spt.fsim(np.round(ref_image * 255, 0), np.round(dist_image * 255, 0), is_output_fsimc=True)
+        #img_plane_seg_gradient_sim = img_gray_plane_seg_gradient_sim(ref_image, dist_image, seg_num, is_segment_mod, C)
+        img_plane_seg_gradient_sim = img_gray_plane_seg_gradient_multiple_scale_sim(ref_image, dist_image, is_segment_mod)
+        #img_plane_sum_sim_measure = img_plane_sum_sim_measure*0 + FSIMc*0 + img_plane_seg_gradient_sim*1
+        img_plane_sum_sim_measure = np.power(img_plane_seg_gradient_sim, 0.3) * np.power(FSIMc, 0.7)
+
+        plane_sum_sims.append(img_plane_sum_sim_measure)
+        i += 1
+        print("image completed:", i, dist_image_name, ref_key, "plane_sum_sim:", img_plane_sum_sim_measure)
+    plane_sum_sims = np.array(plane_sum_sims)
+    return plane_sum_sims
+
+
+def img_plane_compare(img_plane_1, img_plane_2):
+    img_plane_and = img_plane_1 * img_plane_2
+    img_plane_or = img_plane_1 + img_plane_2
+    img_plane_or = np.where(img_plane_or > 0, 1, 0)
+    img_plane_and_sum = np.sum(img_plane_and)
+    img_plane_or_sum = np.sum(img_plane_or)
+    img_plane_sum_ratio = img_plane_or_sum/img_plane_1.size
+    if img_plane_sum_ratio >= 0.3:
+        img_plane_comp_metric = img_plane_and_sum / img_plane_or_sum
+    else:
+        img_plane_comp_metric = -1
+    return img_plane_comp_metric
+
+
+def img_gray_planes_sim(img_plane_list_1, img_plane_list_2):
+    img_plane_num = len(img_plane_list_1)
+    img_plane_comp_metric_list = []
+    i = 0
+    while i < img_plane_num:
+        img_plane_1 = img_plane_list_1[i]
+        img_plane_2 = img_plane_list_2[i]
+        img_plane_comp_metric = img_plane_compare(img_plane_1, img_plane_2)
+        if img_plane_comp_metric >= 0:
+            img_plane_comp_metric_list.append(img_plane_comp_metric)
+        i += 1
+    img_plane_comp_metric_list = np.array(img_plane_comp_metric_list)
+    img_gray_planes_sim_metric = np.mean(img_plane_comp_metric_list)
+    return img_gray_planes_sim_metric, img_plane_comp_metric_list
+
+
+def img_gray_plane_list_extraction(img_gray, seg_num, is_segment_mod):
+    multi_threshold_integer_float, multi_threshold_integer_int, threshold_list_with_zero, threshold_list_with_zero_int, plane_section_num, effective_threshold_last = img_integer_segmentation_equal_range_thresholds_light(img_gray, seg_num, is_segment_mod)
+    img_plane_list = img_segmentation_threshold_list_light(img_gray, multi_threshold_integer_int / INT_GRAY_LEVEL_BAR)
+    return img_plane_list, multi_threshold_integer_int
+
+
+def img_gray_plane_list_extraction_rec(img_gray, seg_num, is_segment_mod, is_rec_aligned=True):
+    img_plane_list, multi_threshold_integer_int = img_gray_plane_list_extraction(img_gray, seg_num, is_segment_mod)
+    aligned_reconstruction_thresholds = range(seg_num)
+    aligned_reconstruction_thresholds = np.array(aligned_reconstruction_thresholds) + 1
+    aligned_reconstruction_thresholds = aligned_reconstruction_thresholds[::-1]
+    if is_rec_aligned:
+        img_gray_rec = img_segmentation_reconstruction_threshold(img_plane_list, aligned_reconstruction_thresholds/INT_GRAY_LEVEL_BAR)
+    else:
+        #img_gray_rec = img_segmentation_reconstruction_threshold(img_plane_list, multi_threshold_integer_int / INT_GRAY_LEVEL_BAR)
+        img_gray_rec = img_gray_planes_reconstruction_avg_mask(img_gray, img_plane_list)
+    img_gray_gradient_map = imq_spt.gradient_map(np.round(img_gray_rec*INT_GRAY_LEVEL_BAR, 0))
+    return img_plane_list, img_gray_rec, img_gray_gradient_map
+
+
+def get_img_gray_planes_sim(img_gray_1, img_gray_2, seg_num, is_segment_mod):
+    img_gray_1 = imq_spt.gradient_map(np.round(img_gray_1 * 255, 0)) / 255
+    img_gray_2 = imq_spt.gradient_map(np.round(img_gray_2 * 255, 0)) / 255
+    img_plane_list_1, multi_threshold_integer_int_1 = img_gray_plane_list_extraction(img_gray_1, seg_num, is_segment_mod)
+    img_plane_list_2, multi_threshold_integer_int_2 = img_gray_plane_list_extraction(img_gray_2, seg_num, is_segment_mod)
+    img_gray_planes_sim_metric, img_plane_comp_metric_list = img_gray_planes_sim(img_plane_list_1, img_plane_list_2)
+    return img_gray_planes_sim_metric, img_plane_comp_metric_list
+
+
+def img_gray_gradient_map_planes_sum(img_gray, seg_num, is_segment_mod=True, resize_ratio=0.5, white_ratio=0.2):
+    img_gray = img_gray_resize(np.round(img_gray * INT_GRAY_LEVEL_BAR, 0), resize_ratio) / INT_GRAY_LEVEL_BAR
+    #img_gray = imq_spt.gradient_map(np.round(img_gray * INT_GRAY_LEVEL_BAR, 0)) / INT_GRAY_LEVEL_BAR
+    img_plane_list, multi_threshold_integer_int = img_gray_plane_list_extraction(img_gray, seg_num, is_segment_mod)
+    img_plane_num = len(img_plane_list)
+    img_gray_shape = img_gray.shape
+    img_gray_w = np.zeros(img_gray_shape)
+    img_gray_b = np.zeros(img_gray_shape)
+    img_gray_size = img_gray.size
+    i = 0
+    while i < img_plane_num:
+        img_plane = img_plane_list[i]
+        img_plane_white_ratio = np.sum(img_plane)/img_gray_size
+        if img_plane_white_ratio >= white_ratio:
+            img_gray_w = img_gray_w + img_plane
+        else:
+            img_gray_b = img_gray_b + img_plane
+        i += 1
+    return img_gray_b, img_gray_w
+
+
+def mos_score_reg_func(x, b1, b2, b3, b4, b5):
+    ret = np.exp(b2*(x-b3))
+    ret = 1 + ret
+    ret = 1/ret
+    ret = 1/2 - ret
+    ret = b1 * ret
+    ret = ret + b4 * x
+    ret = ret + b5
+    return ret
+
+
+def none_linear_regression(func, xdata, ydata, maxfev=100000):
+    popt = curve_fit(func, xdata, ydata, maxfev=maxfev)
+    return popt[0]
+
+
+def mos_sim_score_none_linear_regression_score(mos_score, mos_sim_score):
+    popt = none_linear_regression(mos_score_reg_func, mos_sim_score, mos_score)
+    mos_sim_regression_score = mos_score_reg_func(mos_sim_score, popt[0], popt[1], popt[2], popt[3], popt[4])
+    return mos_sim_regression_score
+
+
+def hvs_sim_img_plane_correlation_cal(img_plane_1, img_plane_2, C):
+    img_plane_cross_correlation = 2*img_plane_1*img_plane_2 + C
+    img_plane_covariance = np.power(img_plane_1, 2) + np.power(img_plane_2, 2) + C
+    img_plane_correlation_matrix = img_plane_cross_correlation / img_plane_covariance
+    img_plane_correlation = np.mean(img_plane_correlation_matrix)
+    return img_plane_correlation_matrix, img_plane_correlation
+
+
+def img_gray_plane_seg_gradient_sim(img_gray_1, img_gray_2, seg_num, is_segment_mod, C):
+    img_plane_list_1, img_gray_rec_1, img_gray_gradient_map_1 = img_gray_plane_list_extraction_rec(img_gray_1, seg_num=seg_num, is_segment_mod=is_segment_mod)
+    img_plane_list_2, img_gray_rec_2, img_gray_gradient_map_2 = img_gray_plane_list_extraction_rec(img_gray_2, seg_num=seg_num, is_segment_mod=is_segment_mod)
+    img_plane_correlation_matrix, img_plane_correlation = hvs_sim_img_plane_correlation_cal(np.round(img_gray_rec_1 * INT_GRAY_LEVEL_BAR, 0), np.round(img_gray_rec_2 * INT_GRAY_LEVEL_BAR, 0), C)
+    img_gradient_correlation_matrix, img_gradient_correlation = hvs_sim_img_plane_correlation_cal(np.round(img_gray_gradient_map_1*255, 0), np.round(img_gray_gradient_map_2*255, 0), C)
+    img_plane_seg_gradient_sim = np.power(img_plane_correlation, 1) * np.power(img_gradient_correlation, 0)
+    return img_plane_seg_gradient_sim
+
+
+def img_gray_dynamic_range_sim(img_gray_1, img_gray_2, C=0.001):
+    img_gray_1_int = np.round(img_gray_1*INT_GRAY_LEVEL_BAR, 0)
+    img_gray_2_int = np.round(img_gray_2*INT_GRAY_LEVEL_BAR, 0)
+    img_gray_dynamic_range_1 = np.array([np.max(img_gray_1_int), np.min(img_gray_1_int)])
+    img_gray_dynamic_range_2 = np.array([np.max(img_gray_2_int), np.min(img_gray_2_int)])
+    img_dynamic_range_correlation_matrix,  img_dynamic_range_correlation = hvs_sim_img_plane_correlation_cal(img_gray_dynamic_range_1, img_gray_dynamic_range_2, C=C)
+    return img_dynamic_range_correlation
+
+
+#img_gray_plane_list_2 is considered as the distorted image
+def img_gray_dynamic_range_positive_negative_diff_sim(img_gray_1, img_gray_2, C=0.001):
+    img_gray_dynamic_range_sub, img_gray_dynamic_range_sub_sign = img_gray_dynamic_range_sub_cal(img_gray_1, img_gray_2)
+    #img_gray_dynamic_range_1 = np.max(img_gray_1) - np.min(img_gray_1)
+    #img_gray_dynamic_range_2 = np.max(img_gray_2) - np.min(img_gray_2)
+    #img_gray_dynamic_range_sub = img_gray_dynamic_range_1 - img_gray_dynamic_range_2
+    #img_gray_dynamic_range_sub_sign = -np.sign(img_gray_dynamic_range_sub)
+    #img_gray_dynamic_range_sub = np.abs(img_gray_dynamic_range_sub)
+    #if img_gray_dynamic_range_2 <= img_gray_dynamic_range_1:
+    if img_gray_dynamic_range_sub_sign <= 0:
+        img_dynamic_range_correlation = 1 - rectified_sigmoid(img_gray_dynamic_range_sub, scalar=1.2)
+    else:
+        img_dynamic_range_correlation = rectified_exp(img_gray_dynamic_range_sub, s_scalar=0.06)#rectified_sigmoid(img_gray_dynamic_range_sub + 2.2, scalar=5.5)
+    return img_dynamic_range_correlation, img_gray_dynamic_range_sub_sign
+
+
+def img_gray_dynamic_range_sub_cal(img_gray_1, img_gray_2):
+    img_gray_dynamic_range_1 = np.max(img_gray_1) - np.min(img_gray_1)
+    img_gray_dynamic_range_2 = np.max(img_gray_2) - np.min(img_gray_2)
+    img_gray_dynamic_range_sub = img_gray_dynamic_range_1 - img_gray_dynamic_range_2
+    img_gray_dynamic_range_sub_sign = -np.sign(img_gray_dynamic_range_sub)
+    img_gray_dynamic_range_sub = np.abs(img_gray_dynamic_range_sub)
+    return img_gray_dynamic_range_sub, img_gray_dynamic_range_sub_sign
+
+
+def img_gray_plane_seg_gradient_multiple_scale_sim(img_gray_1, img_gray_2, is_segment_mod, C=100, seg_num_list=(8,)):
+    scale_len = len(seg_num_list)
+    img_plane_seg_gradient_multiple_scale_sim = 1
+    i = 0
+    while i < scale_len:
+        img_plane_seg_gradient_sim = img_gray_plane_seg_gradient_sim(img_gray_1, img_gray_2, seg_num_list[i], is_segment_mod, C)
+        img_plane_seg_gradient_multiple_scale_sim *= img_plane_seg_gradient_sim
+        i += 1
+    return img_plane_seg_gradient_multiple_scale_sim
+
+
+def img_gray_none_linear_difference_of_gaussian(img_gray, kernel_size_s=(3, 3), kernel_size_l=(15, 15)):
+    low_sigma = cv2.GaussianBlur(np.round(img_gray, 0).astype(np.uint8),  kernel_size_s, 0)
+    high_sigma = cv2.GaussianBlur(np.round(img_gray, 0).astype(np.uint8), kernel_size_l, 0)
+    dog = high_sigma - low_sigma
+    dog_mean = np.mean(dog)
+    dog = np.where(dog >= dog_mean, 1, 0)
+    return dog
+
+
+def get_img_gray_plane_w_b_ratio(img_gray_plane):
+    plane_w_size = np.sum(img_gray_plane)
+    plane_total = img_gray_plane.size
+    plane_w_ratio = plane_w_size / plane_total
+    plane_b_ratio = 1 - plane_w_ratio
+    return plane_w_ratio, plane_b_ratio
+
+
+def adjust_img_gray_plane(img_gray_plane, adjust_ratio=0.5):
+    plane_w_ratio, plane_b_ratio = get_img_gray_plane_w_b_ratio(img_gray_plane)
+    if plane_w_ratio > adjust_ratio:
+        img_gray_plane = np.where(img_gray_plane >0, 0, 1)
+    return img_gray_plane
+
+
+def img_gray_plane_sum_binary(img_gray_plane_sum):
+    plane_intensity_sum = np.sum(img_gray_plane_sum)
+    img_gray_plane_sum_count = np.sum(np.where(img_gray_plane_sum > 0, 1, 0))
+    plane_intensity_mean = np.round(plane_intensity_sum/img_gray_plane_sum_count, 0)
+    img_gray_plane_sum = np.where(img_gray_plane_sum >= plane_intensity_mean, 1, 0)
+    return img_gray_plane_sum
+
+
+def img_gray_planes_simple_sum(img_gray_plane_list):
+    plane_num = len(img_gray_plane_list)
+    plane_shape = img_gray_plane_list[0].shape
+    img_gray_plane_sum = np.zeros(plane_shape)
+    i = 0
+    while i < plane_num:
+        img_gray_plane = img_gray_plane_list[i]
+        img_gray_plane_sum = img_gray_plane_sum + img_gray_plane
+        i += 1
+    #img_gray_plane_sum_mean = np.round(np.mean(img_gray_plane_sum), 0)
+    #img_gray_plane_sum = np.where(img_gray_plane_sum >= img_gray_plane_sum_mean, 1, 0)
+    img_gray_plane_sum = img_gray_plane_sum_binary(img_gray_plane_sum)
+    return img_gray_plane_sum
+
+
+def img_gary_planes_black_white_ratio_inverse(img_gray_plane_list, adjust_ratio=0.5):
+    plane_num = len(img_gray_plane_list)
+    i = 0
+    while i < plane_num:
+        img_gray_plane = img_gray_plane_list[i]
+        plane_w_ratio, plane_b_ratio = get_img_gray_plane_w_b_ratio(img_gray_plane)
+        if plane_w_ratio > adjust_ratio:
+            img_gray_plane = np.where(img_gray_plane > 0, 0, 1)
+            img_gray_plane_list[i] = img_gray_plane
+        i += 1
+    return img_gray_plane_list
+
+
+def img_gray_adjusted_planes_extraction(img_gray, seg_num, is_segment_mod, adjust_ratio=0.5):
+    img_plane_list, img_gray_rec, img_gray_gradient_map = img_gray_plane_list_extraction_rec(img_gray, seg_num, is_segment_mod)
+    img_plane_list = img_gary_planes_black_white_ratio_inverse(img_plane_list, adjust_ratio=adjust_ratio)
+    img_gray_plane_sum = img_gray_planes_simple_sum(img_plane_list)
+    img_gray_plane_sum = img_gray_none_linear_difference_of_gaussian(np.round(img_gray_plane_sum * 255, 0))
+    return img_plane_list, img_gray_plane_sum
+
+
+def array_k_means_cluster(array, centroid_num=2):
+    whitened_array = whiten(array)
+    codebook, distortion = kmeans(whitened_array, centroid_num)
+    codebook = np.sort(codebook)
+    cluster_result, cluster_distortion = vq(whitened_array, codebook)
+    return cluster_result, cluster_distortion
+
+
+def img_gray_planes_w_ratios_extraction(img_gray_plane_list):
+    plane_num = len(img_gray_plane_list)
+    img_gray_plane_w_ratio_list = []
+    i = 0
+    while i < plane_num:
+        img_gray_plane = img_gray_plane_list[i]
+        plane_w_ratio, plane_b_ratio = get_img_gray_plane_w_b_ratio(img_gray_plane)
+        img_gray_plane_w_ratio_list.append(plane_w_ratio)
+        i += 1
+    img_gray_plane_w_ratio_list = np.array(img_gray_plane_w_ratio_list)
+    return img_gray_plane_w_ratio_list
+
+
+def img_gray_planes_w_ratio_cluster(img_gray_plane_list, centroid_num=2):
+    img_gray_plane_w_ratio_list = img_gray_planes_w_ratios_extraction(img_gray_plane_list)
+    w_ratio_cluster_result, w_ratio_cluster_distortion = array_k_means_cluster(img_gray_plane_w_ratio_list, centroid_num)
+    return w_ratio_cluster_result, w_ratio_cluster_distortion
+
+
+def img_gray_plane_list_copy(img_gray_plane_list):
+    img_gray_plane_list_cpy = np.array(img_gray_plane_list)
+    return img_gray_plane_list_cpy
+
+
+def img_gary_planes_clustered_black_white_ratio_inverse(img_gray_plane_list, img_gray_plane_w_ratio_cluster_list):
+    img_gray_plane_list_cpy = img_gray_plane_list_copy(img_gray_plane_list)
+    plane_num = len(img_gray_plane_list)
+    cluster_max = np.max(img_gray_plane_w_ratio_cluster_list)
+    i = 0
+    while i < plane_num:
+        img_gray_plane = img_gray_plane_list[i]
+        if img_gray_plane_w_ratio_cluster_list[i] == cluster_max:
+            img_gray_plane = np.where(img_gray_plane > 0, 0, 1)
+            img_gray_plane_list[i] = img_gray_plane
+        i += 1
+    return img_gray_plane_list, img_gray_plane_list_cpy
+
+
+def img_gray_adjusted_planes_extraction_cluster(img_gray, seg_num, is_segment_mod, centroid_num=2, is_rec_aligned=True):
+    img_plane_list, img_gray_rec, img_gray_gradient_map = img_gray_plane_list_extraction_rec(img_gray, seg_num, is_segment_mod, is_rec_aligned=is_rec_aligned)
+    w_ratio_cluster_result, w_ratio_cluster_distortion = img_gray_planes_w_ratio_cluster(img_plane_list, centroid_num=centroid_num)
+    img_plane_list_inverse, img_plane_list = img_gary_planes_clustered_black_white_ratio_inverse(img_plane_list, w_ratio_cluster_result)
+    #display_img_gray_plane_list(img_plane_list)
+    img_gray_plane_sum = img_gray_planes_simple_sum(img_plane_list_inverse)
+    img_gray_plane_sum = img_gray_none_linear_difference_of_gaussian(np.round(img_gray_plane_sum*255, 0))
+    return img_plane_list, img_gray_plane_sum, img_gray_rec
+
+
+def img_binary_xor(img_binary_1, img_binary_2):
+    img_binary_xor_ret = img_binary_1 - img_binary_2
+    img_binary_xor_ret = np.where(img_binary_xor_ret != 0, 1, 0)
+    return img_binary_xor_ret
+
+
+def img_binary_and(img_binary_1, img_binary_2):
+    img_binary_and_ret = img_binary_1 * img_binary_2
+    return img_binary_and_ret
+
+
+def img_binary_or(img_binary_1, img_binary_2):
+    img_binary_or_ret = img_binary_1 + img_binary_2
+    img_binary_or_ret = np.where(img_binary_or_ret > 0, 1, 0)
+    return img_binary_or_ret
+
+
+def img_iqa_metric_mul_combination(metric_list, weight_list=None):
+    metric_num = len(metric_list)
+    if weight_list is None:
+        weight_list = np.ones(metric_num)
+    metric_mul_ret = 1
+    i = 0
+    while i < metric_num:
+        metric_single = metric_list[i]
+        metric_weight = weight_list[i]
+        metric_single = np.power(metric_single, metric_weight)
+        metric_mul_ret = metric_mul_ret * metric_single
+        i += 1
+    return metric_mul_ret
+
+
+def img_plane_pc_correlation(img_plane_1, img_plane_2, C=1, nscale=4, norient=8, minWaveLength=12, mult=2, sigmaOnf=0.55):
+    M1, m1, ori1, ft1, PC1, EO1, T_1 = pc.phasecong(img_plane_1, nscale=nscale, norient=norient, minWaveLength=minWaveLength, mult=mult, sigmaOnf=sigmaOnf)
+    M2, m2, ori2, ft2, PC2, EO2, T_2 = pc.phasecong(img_plane_2, nscale=nscale, norient=norient, minWaveLength=minWaveLength, mult=mult, sigmaOnf=sigmaOnf)
+    PC1 = np.sum(np.array(PC1), 0)
+    PC2 = np.sum(np.array(PC2), 0)
+    img_plane_correlation_matrix, img_plane_correlation_pc = hvs_sim_img_plane_correlation_cal(PC1, PC2, C=C)
+    img_plane_correlation_pc = zero_proc_metric_correlation_cal(img_plane_correlation_matrix, PC1, PC2)
+    #PCm = np.maximum(PC1, PC2)
+    #img_plane_correlation_pc = np.sum(img_plane_correlation_matrix*PCm)/np.sum(PCm)
+    return img_plane_correlation_matrix, img_plane_correlation_pc
+
+
+def img_plane_hist_diff2_correlation(img_plane_1, img_plane_2, C=0.001):
+    hist_1, bin_edges_1 = np.histogram(np.round(img_plane_1 * INT_GRAY_LEVEL_BAR, 0), bins=range(256), density=True)
+    hist_2, bin_edges_2 = np.histogram(np.round(img_plane_2 * INT_GRAY_LEVEL_BAR, 0), bins=range(256), density=True)
+    hist_1_diff2 = np.diff(np.diff(hist_1))
+    hist_2_diff2 = np.diff(np.diff(hist_2))
+    img_plane_correlation_matrix_1, img_plane_correlation_hist = hvs_sim_img_plane_correlation_cal(hist_1_diff2, hist_2_diff2, C=C)
+    return img_plane_correlation_matrix_1, img_plane_correlation_hist
+
+
+def img_gray_plane_gradient_correlation(img_plane_1, img_plane_2, C=0.001, is_debug=False):
+    img_gray_gradient_1 = imq_spt.gradient_map(np.round(img_plane_1 * 255, 0))
+    img_gray_gradient_2 = imq_spt.gradient_map(np.round(img_plane_2 * 255, 0))
+    if is_debug:
+        plt.subplot(1, 2, 1)
+        plt.imshow(img_gray_gradient_1, cmap='gray')
+        plt.subplot(1, 2, 2)
+        plt.imshow(img_gray_gradient_2, cmap='gray')
+        plt.show()
+    img_plane_correlation_gradient_matrix, img_plane_correlation_gradient = hvs_sim_img_plane_correlation_cal(img_gray_gradient_1, img_gray_gradient_2, C=C)
+    img_plane_correlation_gradient = zero_proc_metric_correlation_cal(img_plane_correlation_gradient_matrix, img_gray_gradient_1, img_gray_gradient_2)
+    #img_gray_gradient_zero = np.power(img_gray_gradient_1, 2) + np.power(img_gray_gradient_2, 2)
+    #img_gray_gradient_zero = np.where(img_gray_gradient_zero > 0, 1, 0)
+    #img_plane_correlation_gradient_matrix_zero = img_plane_correlation_gradient_matrix * img_gray_gradient_zero
+    #img_gray_gradient_zero = np.where(img_gray_gradient_zero == 1, 0, 1)
+    #img_gray_gradient_zero_sum = np.sum(img_gray_gradient_zero)
+    #img_plane_correlation_gradient = np.sum(img_plane_correlation_gradient_matrix_zero)/(img_plane_correlation_gradient_matrix_zero.size - img_gray_gradient_zero_sum)
+    return img_plane_correlation_gradient_matrix, img_plane_correlation_gradient
+
+
+def zero_proc_metric_correlation_cal(correlation_matrix, metric_matrix_1, metric_matrix_2):
+    metric_correlation_zero = np.power(metric_matrix_1, 2) + np.power(metric_matrix_2, 2)
+    metric_correlation_zero = np.where(metric_correlation_zero > 0, 1, 0)
+    correlation_matrix_zero = correlation_matrix * metric_correlation_zero
+    metric_correlation_zero = np.where(metric_correlation_zero == 1, 0, 1)
+    metric_correlation_zero_sum = np.sum(metric_correlation_zero)
+    metric_correlation = np.sum(correlation_matrix_zero) / (correlation_matrix_zero.size - metric_correlation_zero_sum)
+    return metric_correlation
+
+
+def rectified_sigmoid(x, scalar=1.0):
+    sig_ret = np.exp(-scalar * x)
+    sig_ret = 1 + sig_ret
+    sig_ret = 1 / sig_ret
+    sig_ret = 2 * sig_ret
+    sig_ret = sig_ret - 1
+    return sig_ret
+
+
+def zero_magnified_sigmoid(x, s_scalar=0.5, m_scalar=0.02):
+    sig_ret = np.exp(-s_scalar * x)
+    sig_ret = 1 + m_scalar * sig_ret
+    sig_ret = 1 / sig_ret
+    return sig_ret
+
+
+def biased_sigmoid(x, s_scalar=0.02, bias=1):
+    sig_ret = np.exp(-(s_scalar * x + bias))
+    sig_ret = 1 + sig_ret
+    sig_ret = 1 / sig_ret
+    return sig_ret
+
+
+def rectified_exp(x, s_scalar=1.2, m_scalar=0.99):
+    exp_ret = np.exp(s_scalar*x)
+    exp_ret = m_scalar * exp_ret
+    if exp_ret > 1:
+        exp_ret = 1
+    return exp_ret
+
+
+def img_gray_plane_mean_diff(img_plane_1, img_plane_2, mean_scalar=1.5):
+    mean_1 = np.std(img_plane_1)
+    mean_2 = np.std(img_plane_2)
+    mean_sub = np.abs(mean_1 - mean_2)
+    img_plane_correlation_mean = 1 - rectified_sigmoid(mean_sub, scalar=mean_scalar)
+    return img_plane_correlation_mean
+
+
+def img_gray_plane_mean_positive_negative_diff_diff(img_plane_1, img_plane_2, mean_scalar=3):
+    mean_1 = np.mean(img_plane_1)
+    mean_2 = np.mean(img_plane_2)
+    #mean_sub = np.abs(mean_1 - mean_2)
+    mean_sub = mean_2 - mean_1
+    img_plane_mean_correlation = biased_sigmoid(mean_sub, s_scalar=35, bias=7)
+    #if mean_2 <= mean_1:
+        #img_plane_mean_correlation = 1 - rectified_sigmoid(mean_sub, scalar=mean_scalar)
+    #else:
+        #img_plane_mean_correlation = rectified_exp(mean_sub, s_scalar=2)#rectified_sigmoid(mean_sub + 1, scalar=10)
+
+    return img_plane_mean_correlation
+
+
+#img_gray_plane_list_2 is considered as the distorted image
+def img_gray_plane_signal_level_correlation(img_gray_plane_list_1, img_gray_plane_list_2, kernel_size=(3, 3), conv_mode='same', denoise_threshold=9, C=0.01):
+    plane_denoise_sum_1, img_signal_ratio_1, plane_noise_sum_1, img_noise_ratio_1, img_snr_1 = img_gray_planes_denoise_sum(img_gray_plane_list_1, kernel_size=kernel_size, conv_mode=conv_mode, denoise_threshold=denoise_threshold)
+    plane_denoise_sum_2, img_signal_ratio_2, plane_noise_sum_2, img_noise_ratio_2, img_snr_2 = img_gray_planes_denoise_sum(img_gray_plane_list_2, kernel_size=kernel_size, conv_mode=conv_mode, denoise_threshold=denoise_threshold)
+    #plane_signal_level_correlation_matrix, plane_signal_level_correlation = hvs_sim_img_plane_correlation_cal(img_signal_ratio_1, img_signal_ratio_2, C=C)
+    #plane_signal_level_correlation_matrix, plane_signal_level_correlation = hvs_sim_img_plane_correlation_cal(img_snr_1, img_snr_2, C=C)
+    img_snr_sub = np.abs(img_snr_1 - img_snr_2)
+    if img_snr_2 <= img_snr_1:
+        plane_signal_level_correlation = 1 - rectified_sigmoid(img_snr_sub, scalar=1.5)
+    else:
+        plane_signal_level_correlation = rectified_sigmoid(img_snr_sub + 1.3, scalar=7.5)
+    return plane_signal_level_correlation
+
+
+def img_plane_cluster_sum_sim(img_gray_1, img_gray_2, seg_num, is_segment_mod, centroid_num, weight_list=(0.8, 0.1, 0, 0.5, 0, 0.5), C_PC=1, C_HIST=0.001, C_SUM=0.001, C_GRAD=0.001, C_DYNA_R=0.001, mean_scalar=10, kernel_size=(3, 3), conv_mode='same', denoise_threshold=9, C_SIG=0.01, is_rec_aligned=True):
+    img_plane_list_1, img_gray_plane_sum_1, img_gray_rec_1 = img_gray_adjusted_planes_extraction_cluster(img_gray_1, seg_num=seg_num, is_segment_mod=is_segment_mod, centroid_num=centroid_num, is_rec_aligned=is_rec_aligned)
+    img_plane_list_2, img_gray_plane_sum_2, img_gray_rec_2 = img_gray_adjusted_planes_extraction_cluster(img_gray_2, seg_num=seg_num, is_segment_mod=is_segment_mod, centroid_num=centroid_num, is_rec_aligned=is_rec_aligned)
+
+    #test
+    #img_plane_list_1_b, img_gray_plane_sum_1_b, img_gray_rec_1_b = img_gray_adjusted_planes_extraction_cluster(img_gray_1, seg_num=128, is_segment_mod=is_segment_mod, centroid_num=centroid_num, is_rec_aligned=is_rec_aligned)
+    #img_plane_list_2_b, img_gray_plane_sum_2_b, img_gray_rec_2_b = img_gray_adjusted_planes_extraction_cluster(img_gray_2, seg_num=128, is_segment_mod=is_segment_mod, centroid_num=centroid_num, is_rec_aligned=is_rec_aligned)
+    #test
+
+    img_gray_hist_correlation_matrix, img_gray_hist_correlation = img_plane_hist_diff2_correlation(img_gray_1, img_gray_2, C=C_HIST)
+
+    #pc_sum_correlation_matrix, pc_sum_correlation = img_plane_pc_correlation(img_gray_rec_1, img_gray_rec_2, C=C_PC)
+    pc_sum_correlation_matrix, pc_sum_correlation = img_plane_pc_correlation(img_gray_1, img_gray_2, C=C_PC)
+    #pc_sum_correlation_matrix, pc_sum_correlation = img_plane_pc_correlation(img_gray_plane_sum_1, img_gray_plane_sum_2, C=C_PC)
+
+    img_plane_sum_correlation_matrix, img_plane_sum_correlation = hvs_sim_img_plane_correlation_cal(img_gray_plane_sum_1, img_gray_plane_sum_2, C=C_SUM)
+
+    img_plane_correlation_mean = img_gray_plane_mean_diff(img_gray_1, img_gray_2, mean_scalar=mean_scalar)
+    #img_plane_correlation_mean = img_gray_plane_mean_positive_negative_diff_diff(img_gray_1, img_gray_2, mean_scalar=mean_scalar)
+
+    #img_plane_correlation_gradient_matrix, img_plane_correlation_gradient = hvs_sim_img_plane_correlation_cal(np.round(img_gray_rec_1*255, 0), np.round(img_gray_rec_2*255, 0), C=C_GRAD)
+    img_plane_correlation_gradient_matrix, img_plane_correlation_gradient = img_gray_plane_gradient_correlation(img_gray_1, img_gray_2, C=C_GRAD)
+    #img_plane_correlation_gradient_matrix, img_plane_correlation_gradient = img_gray_plane_gradient_correlation(img_gray_rec_1_b, img_gray_rec_2_b, C=C_GRAD)
+
+    plane_signal_level_correlation = img_gray_plane_signal_level_correlation(img_plane_list_1, img_plane_list_2, kernel_size=kernel_size, conv_mode=conv_mode, denoise_threshold=denoise_threshold, C=C_SIG)
+    #img_dynamic_range_correlation = img_gray_dynamic_range_sim(img_gray_1, img_gray_2, C=C_DYNA_R)
+
+    img_dynamic_range_correlation, img_gray_dynamic_range_sub_sign = img_gray_dynamic_range_positive_negative_diff_sim(img_gray_1, img_gray_2, C=C_DYNA_R)
+    img_gray_planes_binary_shape_sim_val = img_gray_planes_binary_shape_sim(img_plane_list_1, img_plane_list_2)
+    metric_list = [pc_sum_correlation, img_gray_hist_correlation, img_plane_sum_correlation, img_plane_correlation_mean, img_plane_correlation_gradient, plane_signal_level_correlation, img_dynamic_range_correlation, img_gray_planes_binary_shape_sim_val]
+    #
+    print(metric_list)
+    #
+    img_plane_cluster_sum_sim_metric = img_iqa_metric_mul_combination(metric_list, weight_list=weight_list)
+    return img_plane_cluster_sum_sim_metric
+
+
+def cal_mos_plane_cluster_sum_sim_scores_gray(ref_image_map, dist_image_list, dist_image_name_list, seg_num, is_segment_mod, centroid_num, weight_list=(1, 0, 0, 0.1, 0.5, 0.2, 0.2, 0.1, 0.1, 0.2, 0.2), C_PC=1, C_HIST=0.001, C_SUM=0.001, mean_scalar=10, C_GRAD=1, kernel_size=(3, 3), conv_mode='same', denoise_threshold=9, C_SIG=0.01, C_DYNA_R=0.001, is_rgb=False, dist_image_name_spliter='_', is_test=False, is_rec_aligned=True):
+    dist_image_num = len(dist_image_list)
+    plane_sum_sims = []
+    i = 0
+    while i < dist_image_num:
+        dist_image_name = dist_image_name_list[i]
+        ref_key = dist_image_name.split(dist_image_name_spliter)[0]
+        ref_key = ref_key.upper()
+        ref_image = ref_image_map[ref_key]
+        dist_image = dist_image_list[i]
+
+        #if is_rgb:
+            #ref_image_gray = img_rgb_to_gray_array_cal(np.round(ref_image * 255, 0))
+            #dist_image_gray = img_rgb_to_gray_array_cal(np.round(dist_image * 255, 0))
+        #else:
+            #ref_image_gray = ref_image
+            #dist_image_gray = dist_image
+
+        img_plane_cluster_sum_sim_measure = img_plane_sim(ref_image, dist_image, seg_num=seg_num, is_segment_mod=is_segment_mod, centroid_num=centroid_num, weight_list=weight_list, C_PC=C_PC, C_HIST=C_HIST, C_SUM=C_SUM, C_GRAD=C_GRAD, C_DYNA_R=C_DYNA_R, mean_scalar=mean_scalar, kernel_size=kernel_size, conv_mode=conv_mode, denoise_threshold=denoise_threshold, C_SIG=C_SIG, is_rec_aligned=is_rec_aligned)
+        #img_plane_cluster_sum_sim_measure = img_plane_cluster_sum_sim(ref_image_gray, dist_image_gray, seg_num=seg_num, is_segment_mod=is_segment_mod, centroid_num=centroid_num, weight_list=weight_list, C_PC=C_PC, C_HIST=C_HIST, C_SUM=C_SUM, C_GRAD=C_GRAD, C_DYNA_R=C_DYNA_R, mean_scalar=mean_scalar, kernel_size=kernel_size, conv_mode=conv_mode, denoise_threshold=denoise_threshold, C_SIG=C_SIG, is_rec_aligned=is_rec_aligned)
+        #test
+        if is_test:
+            FSIMc = imq_spt.fsim(np.round(ref_image * 255, 0), np.round(dist_image * 255, 0), is_output_fsimc=True)
+            img_plane_cluster_sum_sim_measure = FSIMc
+        #test
+        plane_sum_sims.append(img_plane_cluster_sum_sim_measure)
+        i += 1
+        print("image completed:", i, dist_image_name, ref_key, "plane_sum_sim:", img_plane_cluster_sum_sim_measure)
+    plane_sum_sims = np.array(plane_sum_sims)
+    return plane_sum_sims
+
+
+def mos_dist_images_extraction(mos_file_path, dist_file_path, is_rgb=True, img_map_index=IMG_MAP_GREEN_IDX, resize_ratio=0.5):
+    mos_scores, dist_image_name_list = retrieve_mos_info(mos_file_path)
+    dist_file_paths = generate_mos_file_paths(dist_image_name_list, dist_file_path)
+    dist_images = retrieve_mos_raw_images(dist_file_paths, is_rgb=is_rgb, img_map_idx=img_map_index)
+    dist_images = resize_mos_images(dist_images, resize_ratio=resize_ratio)
+    return dist_images, dist_image_name_list, mos_scores
+
+
+def mos_ref_images_extraction(ref_file_path, is_rgb=True, img_map_index=IMG_MAP_GREEN_IDX, resize_ratio=0.5):
+    ref_file_path_list, ref_file_name_list = retrieve_file_paths(ref_file_path)
+    ref_images = retrieve_mos_raw_images(ref_file_path_list, is_rgb=is_rgb, img_map_idx=img_map_index)
+    ref_images = resize_mos_images(ref_images, resize_ratio=resize_ratio)
+    ref_images = generate_mos_ref_file_map(ref_images, ref_file_name_list)
+    return ref_images
+
+
+def img_gray_planes_denoise_sum(img_gray_plane_list, kernel_size=(3, 3), conv_mode='same', denoise_threshold=9, noise_threshold=1):
+    plane_num = len(img_gray_plane_list)
+    plane_shape = img_gray_plane_list[0].shape
+    cov_kernel = np.ones(kernel_size)
+    plane_denoise_sum = np.zeros(plane_shape)
+    plane_noise_sum = np.zeros(plane_shape)
+    i = 0
+    while i < plane_num:
+        img_gray_plane = img_gray_plane_list[i]
+        #img_gray_plane_conv = convolve2d(img_gray_plane, cov_kernel, mode=conv_mode)
+        #denoise_img_gray_plane = np.where(img_gray_plane_conv >= denoise_threshold, 1, 0)
+        #noise_img_gray_plane = np.where(img_gray_plane_conv <= noise_threshold, 1, 0)
+        #noise_img_gray_plane = noise_img_gray_plane * img_gray_plane_conv
+        #noise_img_gray_plane = np.where(noise_img_gray_plane > 0, 1, 0)
+        denoise_img_gray_plane, noise_img_gray_plane = img_binary_plane_noise_proc(img_gray_plane, conv_kernel=cov_kernel, signal_threshold=denoise_threshold, noise_threshold=noise_threshold, kernel_size=kernel_size, conv_mode='same')
+        plane_denoise_sum = plane_denoise_sum + denoise_img_gray_plane
+        plane_noise_sum = plane_noise_sum + noise_img_gray_plane
+        i += 1
+    plane_denoise_sum = np.where(plane_denoise_sum > 0, 1, 0)
+    plane_noise_sum = np.where(plane_noise_sum > 0, 1, 0)
+    img_signal_ratio = np.mean(plane_denoise_sum)
+    img_noise_ratio = np.mean(plane_noise_sum)
+    img_snr = img_signal_ratio / (img_noise_ratio + img_signal_ratio) #img_signal_ratio / img_noise_ratio
+    return plane_denoise_sum, img_signal_ratio, plane_noise_sum, img_noise_ratio, img_snr
+
+
+def img_gray_planes_denoise_adjust(img_gray_plane_list, signal_threshold=9, noise_threshold=2, kernel_size=(3, 3), conv_mode='same'):
+    plane_num = len(img_gray_plane_list)
+    cov_kernel = np.ones(kernel_size)
+    denoise_plane_list = []
+    noise_plane_list = []
+    i = 0
+    while i < plane_num:
+        img_gray_plane = img_gray_plane_list[i]
+        denoise_img_binary_plane, noise_img_binary_plane = img_binary_plane_noise_proc(img_gray_plane, conv_kernel=cov_kernel, signal_threshold=signal_threshold, noise_threshold=noise_threshold, kernel_size=kernel_size, conv_mode=conv_mode)
+        denoise_plane_list.append(denoise_img_binary_plane)
+        noise_plane_list.append(noise_img_binary_plane)
+        i += 1
+    return denoise_plane_list, noise_plane_list
+
+
+def img_binary_plane_noise_proc(img_binary_plane, conv_kernel=None, signal_threshold=9, noise_threshold=2, kernel_size=(3, 3), conv_mode='same'):
+    if conv_kernel is None:
+        conv_kernel = np.ones(kernel_size)
+    img_binary_plane_conv = convolve2d(img_binary_plane, conv_kernel, mode=conv_mode)
+    denoise_img_binary_plane = np.where(img_binary_plane_conv >= signal_threshold, 1, 0)
+    noise_img_binary_plane = np.where(img_binary_plane_conv <= noise_threshold, 1, 0)
+    noise_img_binary_plane = noise_img_binary_plane * img_binary_plane_conv
+    noise_img_binary_plane = np.where(noise_img_binary_plane > 0, 1, 0)
+    denoise_img_binary_plane = np.where(denoise_img_binary_plane > 0, 1, 0)
+    return denoise_img_binary_plane, noise_img_binary_plane
+
+
+def img_binary_sub(img_binary_1, img_binary_2, sub_left_to_right=True):
+    if sub_left_to_right:
+        img_binary_sub_ret = img_binary_1 - img_binary_2
+    else:
+        img_binary_sub_ret = img_binary_2 - img_binary_1
+    img_binary_sub_ret = np.where(img_binary_sub_ret > 0, 1, 0)
+    return img_binary_sub_ret
+
+
+def img_binary_sub_lef_to_right(img_binary_1, img_binary_2):
+    img_binary_sub_ret = img_binary_1 - img_binary_2
+    img_binary_sub_ret = ndarray_threshold_delta_func(img_binary_sub_ret)
+    return img_binary_sub_ret
+
+
+def img_binary_sub_right_to_left(img_binary_1, img_binary_2):
+    img_binary_sub_ret = img_binary_2 - img_binary_1
+    img_binary_sub_ret = ndarray_threshold_delta_func(img_binary_sub_ret)
+    return img_binary_sub_ret
+
+
+def ndarray_threshold_delta_func(x, threshold=0):
+    delta_ret = np.where(x > threshold, 1, 0)
+    return delta_ret
+
+
+def img_planes_xor(img_plane_list_1, img_plane_list_2):
+    plane_num = len(img_plane_list_1)
+    plane_shape = img_plane_list_1[0].shape
+    img_planes_xor_or = np.zeros(plane_shape)
+    img_plane_xor_list = []
+    i = 0
+    while i < plane_num:
+        img_plane_1 = img_plane_list_1[i]
+        img_plane_2 = img_plane_list_2[i]
+        img_plane_xor = img_binary_xor(img_plane_1, img_plane_2)
+        img_plane_xor_list.append(img_plane_xor)
+        img_planes_xor_or = img_binary_or(img_planes_xor_or, img_plane_xor)
+        i += 1
+    return img_plane_xor_list, img_planes_xor_or
+
+
+def img_planes_sub(img_plane_list_1, img_plane_list_2, sub_left_to_right=True):
+    plane_num = len(img_plane_list_1)
+    plane_shape = img_plane_list_1[0].shape
+    img_planes_sub_or = np.zeros(plane_shape)
+    img_plane_sub_list = []
+    i = 0
+    while i < plane_num:
+        img_plane_1 = img_plane_list_1[i]
+        img_plane_2 = img_plane_list_2[i]
+        img_plane_sub = img_binary_sub(img_plane_1, img_plane_2, sub_left_to_right=sub_left_to_right)
+        #
+        img_plane_sub = img_binary_plane_noise_proc(img_plane_sub)[0]
+        #
+        img_plane_sub_list.append(img_plane_sub)
+        img_planes_sub_or = img_binary_or(img_planes_sub_or, img_plane_sub)
+        i += 1
+    return img_plane_sub_list, img_planes_sub_or
+
+
+def img_planes_and(img_plane_list_1, img_plane_list_2):
+    plane_num = len(img_plane_list_1)
+    plane_shape = img_plane_list_1[0].shape
+    img_planes_sub_or = np.zeros(plane_shape)
+    img_plane_sub_list = []
+    i = 0
+    while i < plane_num:
+        img_plane_1 = img_plane_list_1[i]
+        img_plane_2 = img_plane_list_2[i]
+        img_plane_sub = img_binary_and(img_plane_1, img_plane_2)
+        img_plane_sub_list.append(img_plane_sub)
+        img_planes_sub_or = img_binary_or(img_planes_sub_or, img_plane_sub)
+        i += 1
+    return img_plane_sub_list, img_planes_sub_or
+
+
+def img_planes_binary_operate(img_plane_list_1, img_plane_list_2, binary_operator, is_denoise=True):
+    plane_num = len(img_plane_list_1)
+    plane_shape = img_plane_list_1[0].shape
+    img_plane_binary_ret_or = np.zeros(plane_shape)
+    img_plane_sub_list = []
+    i = 0
+    while i < plane_num:
+        img_plane_1 = img_plane_list_1[i]
+        img_plane_2 = img_plane_list_2[i]
+        img_plane_binary_ret = binary_operator(img_plane_1, img_plane_2)
+        if is_denoise:
+            img_plane_binary_ret = img_binary_plane_noise_proc(img_plane_binary_ret)[0]
+        img_plane_sub_list.append(img_plane_binary_ret)
+        img_plane_binary_ret_or = img_binary_or(img_plane_binary_ret_or, img_plane_binary_ret)
+        i += 1
+    return img_plane_sub_list, img_plane_binary_ret_or
+
+
+def img_gray_diff_density_filter(img_gray_diff, diff_mean_threshold_num=10):
+    img_gray_diff_sum = np.sum(img_gray_diff)
+    img_gray_diff_mean = img_gray_diff_sum / img_gray_diff.size
+    diff_mean_threshold = diff_mean_threshold_num / img_gray_diff.size
+    if img_gray_diff_mean >= diff_mean_threshold:
+        img_gray_diff_ret = img_gray_diff_sum
+    else:
+        img_gray_diff_ret = 0
+    return img_gray_diff_ret
+
+
+def threshold_delta(x, delta_threshold):
+    if x >= delta_threshold:
+        delta_ret = 1
+    else:
+        delta_ret = 0
+    return delta_ret
+
+
+def img_planes_sub_density_filter_ratio(img_planes_sub_or_1, img_planes_sub_or_2, filter_threshold_num=50, filter_threshold_ratio=0.1):
+    sub_or_mean_1 = np.mean(img_planes_sub_or_1)
+    sub_or_mean_2 = np.mean(img_planes_sub_or_2)
+    sub_or_mean_min = np.fmin(sub_or_mean_1, sub_or_mean_2)
+    sub_or_mean_max = np.fmax(sub_or_mean_1, sub_or_mean_2)
+    sub_or_mean_min_threshold = filter_threshold_num/img_planes_sub_or_1.size
+    if sub_or_mean_min < sub_or_mean_min_threshold:
+        sub_or_mean_min = 0
+    if sub_or_mean_max == 0:
+        sub_or_delta = 0
+    else:
+        sub_or_mean_ratio = sub_or_mean_min / sub_or_mean_max
+        sub_or_delta = threshold_delta(sub_or_mean_ratio, filter_threshold_ratio)
+    img_planes_sub_or_ret_1 = img_planes_sub_or_1 * sub_or_delta
+    img_planes_sub_or_ret_2 = img_planes_sub_or_2 * sub_or_delta
+    return img_planes_sub_or_ret_1, img_planes_sub_or_ret_2
+
+
+def img_planes_sub_density_filter(img_planes_sub_or_1, img_planes_sub_or_2, filter_threshold_num=400):
+    sub_or_mean_1 = np.mean(img_planes_sub_or_1)
+    sub_or_mean_2 = np.mean(img_planes_sub_or_2)
+    #
+    print("sub_ratio:", np.fmin(sub_or_mean_1, sub_or_mean_2) / np.fmax(sub_or_mean_1, sub_or_mean_2))
+    #
+    sub_or_mean_cross = sub_or_mean_1 * sub_or_mean_2
+    filter_threshold = np.power(filter_threshold_num/img_planes_sub_or_1.size, 2)
+    sub_or_delta = threshold_delta(sub_or_mean_cross, filter_threshold)
+    img_planes_sub_or_ret_1 = img_planes_sub_or_1 * sub_or_delta
+    img_planes_sub_or_ret_2 = img_planes_sub_or_2 * sub_or_delta
+    return img_planes_sub_or_ret_1, img_planes_sub_or_ret_2
+
+
+def img_gray_planes_binary_shape_sim(img_plane_list_1, img_plane_list_2, sub_xor_sig_ratio=0.5, is_debug=False):
+    img_plane_and_sub_list_1, img_planes_and_sub_or_1 = img_planes_binary_operate(img_plane_list_1, img_plane_list_2, img_binary_sub_lef_to_right)
+    img_plane_and_sub_list_2, img_planes_and_sub_or_2 = img_planes_binary_operate(img_plane_list_2, img_plane_list_1, img_binary_sub_lef_to_right)
+
+    img_planes_and_sub_or_and = img_binary_and(img_planes_and_sub_or_1, img_planes_and_sub_or_2)
+    img_planes_and_sub_or_xor = img_binary_xor(img_planes_and_sub_or_1, img_planes_and_sub_or_2)
+
+    #test
+    if is_debug:
+        plt.subplot(1, 2, 1)
+        plt.imshow(img_planes_and_sub_or_and, cmap='gray')
+        plt.subplot(1, 2, 2)
+        plt.imshow(img_planes_and_sub_or_xor, cmap='gray')
+        plt.show()
+    #test
+
+    img_planes_and_sub_or_and, img_planes_and_sub_or_xor = img_planes_sub_density_filter_ratio(img_planes_and_sub_or_and, img_planes_and_sub_or_xor)
+
+    #img_planes_and_sub_or_and = img_binary_plane_noise_proc(img_planes_and_sub_or_and)[0]
+    #img_planes_and_sub_or_xor = img_binary_plane_noise_proc(img_planes_and_sub_or_xor)[0]
+
+    #img_planes_and_sub_or_and_sum = np.sum(img_planes_and_sub_or_and)
+    #img_planes_and_sub_or_xor_sum = np.sum(img_planes_and_sub_or_xor)
+    #mg_planes_and_sub_or_and_mean = img_planes_and_sub_or_and_sum / img_planes_and_sub_or_and.size
+    #img_planes_and_sub_or_xor_mean = img_planes_and_sub_or_xor_sum / img_planes_and_sub_or_xor.size
+
+    img_planes_and_sub_or_and_sum = img_gray_diff_density_filter(img_planes_and_sub_or_and)
+    img_planes_and_sub_or_xor_sum = img_gray_diff_density_filter(img_planes_and_sub_or_xor)
+
+    img_planes_and_sub_or_ratio_u = np.fmin(img_planes_and_sub_or_and_sum, img_planes_and_sub_or_xor_sum)
+    img_planes_and_sub_or_ratio_d = np.fmax(img_planes_and_sub_or_and_sum, img_planes_and_sub_or_xor_sum)
+
+    if img_planes_and_sub_or_ratio_d > 0:
+        img_gray_planes_binary_shape_sim_val = img_planes_and_sub_or_ratio_u / img_planes_and_sub_or_ratio_d
+    else:
+        img_gray_planes_binary_shape_sim_val = 1
+    if img_planes_and_sub_or_xor_sum * sub_xor_sig_ratio < img_planes_and_sub_or_and_sum:
+        img_gray_planes_binary_shape_sim_val = 1 - img_gray_planes_binary_shape_sim_val
+
+    return img_gray_planes_binary_shape_sim_val
+
+
+def get_img_plane_rec_intensity_plane(img_gray_org, img_binary_plane):
+    pixel_num = np.sum(img_binary_plane)
+    if pixel_num == 0:
+        img_gray_rec_intensity = 0
+    else:
+        img_gray_rec_intensity = np.sum(img_gray_org * img_binary_plane)/np.sum(img_binary_plane)
+    img_rec_plane = img_binary_plane * img_gray_rec_intensity
+    return img_rec_plane
+
+
+def img_gray_planes_reconstruction_avg_mask(img_gray_org, img_gray_plane_list):
+    plane_num = len(img_gray_plane_list)
+    img_shape = img_gray_org.shape
+    img_gray_rec = np.zeros(img_shape)
+    i = 0
+    while i < plane_num:
+        img_rec_plane = get_img_plane_rec_intensity_plane(img_gray_org, img_gray_plane_list[i])
+        img_gray_rec = img_gray_rec + img_rec_plane
+        i += 1
+    return img_gray_rec
+
+
+def img_planes_sum(img_plane_list, is_normalize=True):
+    img_plane_array = np.array(img_plane_list)
+    img_plane_sum = np.sum(np.sum(img_plane_array, axis=2), axis=1)
+    if is_normalize:
+        img_plane_sum = img_plane_sum / np.sum(img_plane_sum)
+    return img_plane_sum
+
+
+def img_gray_planes_hist_sim(img_plane_list_1, img_plane_list_2, C=0.01):
+    img_plane_sum_1 = img_planes_sum(img_plane_list_1)
+    img_plane_sum_2 = img_planes_sum(img_plane_list_2)
+    img_plane_correlation_matrix, img_plane_correlation = hvs_sim_img_plane_correlation_cal(img_plane_sum_1, img_plane_sum_2, C=C)
+    return img_plane_correlation_matrix, img_plane_correlation
+
+
+def img_gray_planes_hist_diff(img_plane_list_1, img_plane_list_2):
+    plane_num = len(img_plane_list_1)
+    img_plane_sum_1 = img_planes_sum(img_plane_list_1)
+    img_plane_sum_2 = img_planes_sum(img_plane_list_2)
+    img_plane_sum_sub = img_plane_sum_1 - img_plane_sum_2
+    hist_sub_weight = np.array(range(plane_num)) + 1
+    hist_sub_weight = hist_sub_weight[::-1]
+    img_plane_sum_sub_diff = np.sum(img_plane_sum_sub*hist_sub_weight)
+    return img_plane_sum_sub_diff
+
+
+def img_i_convert(img):
+    img_shape = img.shape
+    I = np.zeros(img_shape)
+    if img.ndim == 3:
+        img_plane_0 = img[:, :, 0]
+        img_plane_1 = img[:, :, 1]
+        img_plane_2 = img[:, :, 2]
+        I = 0.596 * img_plane_0 - 0.274 * img_plane_1 - 0.322 * img_plane_2
+    return I
+
+
+def img_q_convert(img):
+    img_shape = img.shape
+    Q = np.zeros(img_shape)
+    if img.ndim == 3:
+        img_plane_0 = img[:, :, 0]
+        img_plane_1 = img[:, :, 1]
+        img_plane_2 = img[:, :, 2]
+        Q = 0.211 * img_plane_0 - 0.523 * img_plane_1 + 0.312 * img_plane_2
+    return Q
+
+
+def img_rgb_planes_hist_diff(img_red_plane_list, img_green_plane_list, img_blue_plane_list, img_gray_plane_list):
+    img_plane_sum_sub_diff_red = img_gray_planes_hist_diff(img_red_plane_list, img_gray_plane_list)
+    img_plane_sum_sub_diff_green = img_gray_planes_hist_diff(img_green_plane_list, img_gray_plane_list)
+    img_plane_sum_sub_diff_blue = img_gray_planes_hist_diff(img_blue_plane_list, img_gray_plane_list)
+    return img_plane_sum_sub_diff_red, img_plane_sum_sub_diff_green, img_plane_sum_sub_diff_blue
+
+
+def img_rgb_overall_chromatic_metric(img_plane_sum_sub_diff_red, img_plane_sum_sub_diff_green, img_plane_sum_sub_diff_blue):
+    img_plane_sum_sub_diff_range_array = np.array([img_plane_sum_sub_diff_red, img_plane_sum_sub_diff_green, img_plane_sum_sub_diff_blue])
+    overall_chromatic_metric = np.sum(img_plane_sum_sub_diff_range_array)
+    return overall_chromatic_metric
+
+
+def img_rgb_chromatic_contrast_quality_metric(img_plane_sum_sub_diff_red, img_plane_sum_sub_diff_green, img_plane_sum_sub_diff_blue):
+    img_plane_sum_sub_diff_range_array = np.array([img_plane_sum_sub_diff_red, img_plane_sum_sub_diff_green, img_plane_sum_sub_diff_blue])
+    chromatic_contrast_quality_metric = np.max(img_plane_sum_sub_diff_range_array) - np.min(img_plane_sum_sub_diff_range_array)
+    return chromatic_contrast_quality_metric
+
+
+def img_rgb_overall_chromatic_diff_metric(overall_chromatic_metric_1, overall_chromatic_metric_2, metric_scalar=1.5):
+    overall_chromatic_diff_metric = np.abs(overall_chromatic_metric_1 - overall_chromatic_metric_2)
+    overall_chromatic_diff_metric = np.exp(-metric_scalar * overall_chromatic_diff_metric)
+    return overall_chromatic_diff_metric
+
+
+# The order of dist and ref should be kept because of subtraction
+def img_rgb_color_contrast_quality_diff_metric(color_contrast_quality_metric_dist, color_contrast_quality_metric_ref, s_scalar=20, bias=5, metric_low_threshold=0.7):
+    color_contrast_quality_diff_metric = color_contrast_quality_metric_dist - color_contrast_quality_metric_ref
+    if color_contrast_quality_diff_metric == 0:
+        color_contrast_quality_diff_metric = 1
+    else:
+        color_contrast_quality_diff_metric = biased_sigmoid(color_contrast_quality_diff_metric, s_scalar=s_scalar, bias=bias)
+    if color_contrast_quality_diff_metric <= metric_low_threshold:
+        color_contrast_quality_diff_metric = metric_low_threshold
+    return color_contrast_quality_diff_metric
+
+
+def img_rgb_basic_channels(img_rgb, resize_ratio=0.5, interpolation=cv2.INTER_NEAREST):
+    img_rgb_red = img_rgb[:, :, IMG_MAP_RED_IDX]
+    img_rgb_green = img_rgb[:, :, IMG_MAP_GREEN_IDX]
+    img_rgb_blue = img_rgb[:, :, IMG_MAP_BLUE_IDX]
+    img_rgb_gray = img_rgb_to_gray_array_cal(np.round(img_rgb * INT_GRAY_LEVEL_BAR, 0))
+    #img_rgb_gray_resized = img_gray_resize(np.round(img_rgb_gray*INT_GRAY_LEVEL_BAR, 0), resize_ratio, interpolation=interpolation)/INT_GRAY_LEVEL_BAR
+    return img_rgb_gray, img_rgb_red, img_rgb_green, img_rgb_blue
+
+
+def img_rgb_channels(img_rgb, seg_num, is_segment_mod, is_rec_aligned=True):
+    img_rgb_gray, img_rgb_red, img_rgb_green, img_rgb_blue = img_rgb_basic_channels(img_rgb)
+    img_plane_list_gray, img_gray_rec_gray, img_gray_gradient_map_gray = img_gray_plane_list_extraction_rec(img_rgb_gray, seg_num=seg_num, is_segment_mod=is_segment_mod, is_rec_aligned=is_rec_aligned)
+    img_plane_list_red, img_gray_rec_red, img_gray_gradient_map_red = img_gray_plane_list_extraction_rec(img_rgb_red, seg_num=seg_num, is_segment_mod=is_segment_mod, is_rec_aligned=is_rec_aligned)
+    img_plane_list_green, img_gray_rec_green, img_gray_gradient_map_green = img_gray_plane_list_extraction_rec(img_rgb_green, seg_num=seg_num, is_segment_mod=is_segment_mod, is_rec_aligned=is_rec_aligned)
+    img_plane_list_blue, img_gray_rec_blue, img_gray_gradient_map_blue = img_gray_plane_list_extraction_rec(img_rgb_blue, seg_num=seg_num, is_segment_mod=is_segment_mod, is_rec_aligned=is_rec_aligned)
+    return img_rgb_gray, img_plane_list_gray, img_plane_list_red, img_plane_list_green, img_plane_list_blue
+
+
+def img_rgb_chromatic_metric(img_rgb_ref, img_rgb_dist, seg_num, is_segment_mod, is_rec_aligned=True):
+    img_rgb_gray_dist, img_plane_list_gray_dist, img_plane_list_red_dist, img_plane_list_green_dist, img_plane_list_blue_dist = img_rgb_channels(img_rgb_dist, seg_num, is_segment_mod, is_rec_aligned=is_rec_aligned)
+    img_rgb_gray_ref, img_plane_list_gray_ref, img_plane_list_red_ref, img_plane_list_green_ref, img_plane_list_blue_ref = img_rgb_channels(img_rgb_ref, seg_num, is_segment_mod, is_rec_aligned=is_rec_aligned)
+
+    img_plane_sum_sub_diff_red_dist, img_plane_sum_sub_diff_green_dist, img_plane_sum_sub_diff_blue_dist = img_rgb_planes_hist_diff(img_plane_list_red_dist, img_plane_list_green_dist, img_plane_list_blue_dist, img_plane_list_gray_dist)
+    img_plane_sum_sub_diff_red_ref, img_plane_sum_sub_diff_green_ref, img_plane_sum_sub_diff_blue_ref = img_rgb_planes_hist_diff(img_plane_list_red_ref, img_plane_list_green_ref, img_plane_list_blue_ref, img_plane_list_gray_ref)
+
+    overall_chromatic_metric_dist = img_rgb_overall_chromatic_metric(img_plane_sum_sub_diff_red_dist, img_plane_sum_sub_diff_green_dist, img_plane_sum_sub_diff_blue_dist)
+    overall_chromatic_metric_ref = img_rgb_overall_chromatic_metric(img_plane_sum_sub_diff_red_ref, img_plane_sum_sub_diff_green_ref, img_plane_sum_sub_diff_blue_ref)
+
+    chromatic_contrast_quality_metric_dist = img_rgb_chromatic_contrast_quality_metric(img_plane_sum_sub_diff_red_dist, img_plane_sum_sub_diff_green_dist, img_plane_sum_sub_diff_blue_dist)
+    chromatic_contrast_quality_metric_ref = img_rgb_chromatic_contrast_quality_metric(img_plane_sum_sub_diff_red_ref, img_plane_sum_sub_diff_green_ref, img_plane_sum_sub_diff_blue_ref)
+
+    overall_chromatic_diff_metric = img_rgb_overall_chromatic_diff_metric(overall_chromatic_metric_dist, overall_chromatic_metric_ref)
+    color_contrast_quality_diff_metric = img_rgb_color_contrast_quality_diff_metric(chromatic_contrast_quality_metric_dist, chromatic_contrast_quality_metric_ref)
+    return img_rgb_gray_dist, img_rgb_gray_ref, img_plane_list_gray_dist, img_plane_list_gray_ref, overall_chromatic_diff_metric, color_contrast_quality_diff_metric
+
+
+def vector_cos_distance(v1, v2):
+    v_cos_distance = np.sum(v1 * v2)
+    v_cos_distance = v_cos_distance/(np.linalg.norm(v1)*np.linalg.norm(v2))
+    return v_cos_distance
+
+
+def img_plane_sim(img_ref, img_dist, seg_num, is_segment_mod, centroid_num, weight_list=(1, 0, 0, 0.1, 0.5, 0.2, 0.2, 0.1, 0.1, 0.2, 0.2), C_PC=1, C_HIST=0.001, C_SUM=0.001, C_GRAD=0.001, C_DYNA_R=0.001, mean_scalar=10, kernel_size=(3, 3), conv_mode='same', denoise_threshold=9, C_SIG=0.01, is_rec_aligned=True):
+    if img_ref.ndim == 3:
+        #img_rgb_gray_dist, img_rgb_gray_ref, img_plane_list_gray_dist, img_plane_list_gray_ref, overall_chromatic_diff_metric, color_contrast_quality_diff_metric = img_rgb_chromatic_metric(img_dist, img_ref, seg_num, is_segment_mod=is_segment_mod, is_rec_aligned=is_rec_aligned)
+        img_rgb_gray_ref, img_rgb_red_ref, img_rgb_green_ref, img_rgb_blue_ref = img_rgb_basic_channels(img_ref)
+        img_rgb_gray_dist, img_rgb_red_dist, img_rgb_green_dist, img_rgb_blue_dist = img_rgb_basic_channels(img_dist)
+        v_skewness_diff_distance_score, skewness_diff_max_sub_score = img_rgb_chromatic_mean_skewness_metric(img_rgb_gray_ref, img_rgb_red_ref, img_rgb_green_ref, img_rgb_blue_ref, img_rgb_gray_dist, img_rgb_red_dist, img_rgb_green_dist, img_rgb_blue_dist)
+    else:
+        #overall_chromatic_diff_metric = 1
+        #color_contrast_quality_diff_metric = 1
+        v_skewness_diff_distance_score = 1
+        skewness_diff_max_sub_score = 1
+        img_rgb_gray_dist = img_dist
+        img_rgb_gray_ref = img_ref
+        #img_plane_list_gray_dist, img_gray_plane_sum_1, img_gray_rec_1 = img_gray_adjusted_planes_extraction_cluster(img_rgb_gray_dist, seg_num=seg_num, is_segment_mod=is_segment_mod, centroid_num=centroid_num, is_rec_aligned=is_rec_aligned)
+        #img_plane_list_gray_ref, img_gray_plane_sum_2, img_gray_rec_2 = img_gray_adjusted_planes_extraction_cluster(img_rgb_gray_ref, seg_num=seg_num, is_segment_mod=is_segment_mod, centroid_num=centroid_num, is_rec_aligned=is_rec_aligned)
+    pc_sum_correlation, img_gray_hist_correlation, img_plane_sum_correlation, img_plane_correlation_mean, img_plane_correlation_gradient, plane_signal_level_correlation, img_dynamic_range_correlation, img_gray_planes_binary_shape_sim_val, skewness_diff_score = img_gray_sim_metrics(img_rgb_gray_ref, img_rgb_gray_dist, seg_num=seg_num, is_segment_mod=is_segment_mod, centroid_num=centroid_num, C_PC=C_PC, C_HIST=C_HIST, C_SUM=C_SUM, C_GRAD=C_GRAD, C_DYNA_R=C_DYNA_R, mean_scalar=mean_scalar, kernel_size=kernel_size, conv_mode=conv_mode, denoise_threshold=denoise_threshold, C_SIG=C_SIG, is_rec_aligned=is_rec_aligned)
+    metric_list = [pc_sum_correlation, img_gray_hist_correlation, img_plane_sum_correlation, img_plane_correlation_mean, img_plane_correlation_gradient, plane_signal_level_correlation, img_dynamic_range_correlation, img_gray_planes_binary_shape_sim_val, v_skewness_diff_distance_score, skewness_diff_max_sub_score, skewness_diff_score]
+    print(metric_list)
+    img_plane_sim_metric = img_iqa_metric_mul_combination(metric_list, weight_list=weight_list)
+    return img_plane_sim_metric
+
+
+def img_gray_plane_mean_skewness(img_gray_plane):
+    plane_min = np.min(img_gray_plane)
+    plane_max = np.max(img_gray_plane)
+    plane_mean = np.mean(img_gray_plane)
+    plane_mean_skewness = (plane_mean - plane_min)/(plane_max - plane_min)
+    return plane_mean_skewness
+
+
+def img_rgb_plane_mean_skewness(img_gray_plane, img_red_plane, img_green_plane, img_blue_plane):
+    gray_mean_skewness = img_gray_plane_mean_skewness(img_gray_plane)
+    red_mean_skewness = img_gray_plane_mean_skewness(img_red_plane)
+    green_mean_skewness = img_gray_plane_mean_skewness(img_green_plane)
+    blue_mean_skewness = img_gray_plane_mean_skewness(img_blue_plane)
+    v_mean_skewness = np.array([red_mean_skewness, green_mean_skewness, blue_mean_skewness])
+    return gray_mean_skewness, v_mean_skewness
+
+
+def img_rgb_plane_mean_skewness_gray_diff_v(v_mean_skewness, gray_mean_skewness):
+    v_skewness_gray_diff = v_mean_skewness - gray_mean_skewness
+    return v_skewness_gray_diff
+
+
+def img_rgb_plane_mean_skewness_gray_diff_max(v_mean_skewness, gray_mean_skewness):
+    v_skewness_gray_diff_sub = v_mean_skewness - gray_mean_skewness
+    #skewness_gray_diff_max = np.max(np.abs(v_mean_skewness - gray_mean_skewness))
+    skewness_gray_diff_max = np.max(v_skewness_gray_diff_sub) - np.min(v_skewness_gray_diff_sub)
+    return skewness_gray_diff_max, v_skewness_gray_diff_sub
+
+
+def img_rgb_plane_mean_skewness_diff_v_dist_ref_distance(v_skewness_gray_diff_ref, v_skewness_gray_diff_dist, s_scalar=0.5):
+    v_skewness_diff_sub = v_skewness_gray_diff_ref - v_skewness_gray_diff_dist
+    v_skewness_diff_sub = np.linalg.norm(v_skewness_diff_sub)
+    v_skewness_diff_distance_score = np.exp(-s_scalar*v_skewness_diff_sub)
+    return v_skewness_diff_sub, v_skewness_diff_distance_score
+
+
+# dist and ref are ordered
+def img_rgb_plane_mean_skewness_diff_v_dist_ref_max_diff(skewness_gray_diff_max_ref, skewness_gray_diff_max_dist, s_scalar=40, bias=5):
+    skewness_diff_max_sub = skewness_gray_diff_max_dist - skewness_gray_diff_max_ref
+    skewness_diff_max_sub_score = biased_sigmoid(skewness_diff_max_sub, s_scalar=s_scalar, bias=bias)
+    return skewness_diff_max_sub, skewness_diff_max_sub_score
+
+
+def img_gray_mean_skewness_diff(img_gray_ref, img_gray_dist, s_scalar=21, bias=5):
+    img_gray_mean_skewness_ref = img_gray_plane_mean_skewness(img_gray_ref)
+    img_gray_mean_skewness_dist = img_gray_plane_mean_skewness(img_gray_dist)
+    skewness_diff, skewness_diff_score = img_rgb_plane_mean_skewness_diff_v_dist_ref_max_diff(img_gray_mean_skewness_ref, img_gray_mean_skewness_dist, s_scalar=s_scalar, bias=bias)
+    return skewness_diff, skewness_diff_score
+
+
+def img_rgb_plane_mean_skewness_quality_diff(v_skewness_gray_diff_sub_ref, v_skewness_gray_diff_sub_dist):
+    v_skewness_gray_diff_sub_ref_sign = np.sign(v_skewness_gray_diff_sub_ref)
+    v_skewness_gray_diff_sub_dist_sign = np.sign(v_skewness_gray_diff_sub_dist)
+    dist_ref_sign_cross = v_skewness_gray_diff_sub_ref_sign * v_skewness_gray_diff_sub_dist_sign
+    dist_ref_sign_cross_neg_mask = np.where(dist_ref_sign_cross == -1, 1, 0)
+    dist_ref_sign_cross_pos_mask = np.where(dist_ref_sign_cross == 1, 1, 0)
+    mean_skewness_quality_diff_pos = np.abs(v_skewness_gray_diff_sub_dist) - np.abs(v_skewness_gray_diff_sub_ref)
+    mean_skewness_quality_diff_neg = -np.abs(v_skewness_gray_diff_sub_dist - v_skewness_gray_diff_sub_ref)
+    mean_skewness_quality_diff = (dist_ref_sign_cross_pos_mask * mean_skewness_quality_diff_pos) + (dist_ref_sign_cross_neg_mask * mean_skewness_quality_diff_neg)
+    mean_skewness_quality_diff = np.sum(mean_skewness_quality_diff)
+    return mean_skewness_quality_diff
+
+
+def img_rgb_plane_mean_skewness_quality_diff_channel_wise_old(v_skewness_gray_diff_sub_ref, v_skewness_gray_diff_sub_dist):
+    v_skewness_sub = np.zeros(3)
+    v_skewness_sub[0] = v_skewness_gray_diff_sub_dist[0] - v_skewness_gray_diff_sub_ref[0]
+    v_skewness_sub[1] = -1 * (np.abs(v_skewness_gray_diff_sub_dist[1]) - np.abs(v_skewness_gray_diff_sub_ref[1]))
+    v_skewness_sub[2] = -1 * (v_skewness_gray_diff_sub_dist[2] - v_skewness_gray_diff_sub_ref[2])
+    mean_skewness_quality_diff = np.sum(v_skewness_sub)
+    return mean_skewness_quality_diff
+
+
+def long_tail_func(x, p_scalar=2.5, s_scalar=100):
+    y = np.exp(-np.power(x, p_scalar) * s_scalar)
+    return y
+
+
+def negative_range_constrained_power_func(x, c, p_scalar=2):
+    y = np.abs((1/np.power(c, p_scalar))*np.power((x + c), p_scalar)) - 1
+    return y
+
+
+def img_rgb_plane_mean_skewness_quality_diff_channel_wise(v_skewness_gray_diff_sub_ref, v_skewness_gray_diff_sub_dist, green_sig_scalar=1):
+    v_skewness_sub = np.abs(v_skewness_gray_diff_sub_dist) - np.abs(v_skewness_gray_diff_sub_ref)
+    v_skewness_sub[1] = -1 * green_sig_scalar * v_skewness_sub[1]
+    red_sign = np.abs(np.sign(np.abs(np.sign(v_skewness_gray_diff_sub_ref[0]) - np.sign(v_skewness_gray_diff_sub_dist[0]))))
+    blue_sign = np.abs(np.sign(np.abs(np.sign(v_skewness_gray_diff_sub_ref[2]) - np.sign(v_skewness_gray_diff_sub_dist[2]))))
+    red_blue_sign = np.abs(red_sign - blue_sign)
+    green_sign = np.abs(np.sign(v_skewness_gray_diff_sub_ref[1]) - np.sign(v_skewness_gray_diff_sub_dist[1]))
+    if green_sign > 0:
+        v_skewness_sub = -1 * v_skewness_sub
+    elif red_blue_sign > 0:
+        v_red_blue_sign_neg = np.array([red_sign, 1, blue_sign]) * -2
+        v_skewness_sub = v_skewness_sub + v_skewness_sub * v_red_blue_sign_neg
+    mean_skewness_quality_diff = np.sum(v_skewness_sub)
+    if mean_skewness_quality_diff == 0:
+        mean_skewness_quality_diff = 1
+    return mean_skewness_quality_diff
+
+
+def rgb_plane_mean_skewness_color_strength(v_skewness_gray_diff_sub, green_scalar=0.3):
+    v_color_strength = np.abs(v_skewness_gray_diff_sub)
+    color_strength = v_color_strength[0] + green_scalar * v_color_strength[1] + v_color_strength[2]
+    return color_strength
+
+
+def rgb_plane_mean_skewness_color_strength_diff(v_skewness_gray_diff_sub_ref, v_skewness_gray_diff_sub_dist):
+    color_strength_ref = rgb_plane_mean_skewness_color_strength(v_skewness_gray_diff_sub_ref)
+    color_strength_dist = rgb_plane_mean_skewness_color_strength(v_skewness_gray_diff_sub_dist)
+    color_strength_diff = color_strength_dist - color_strength_ref
+    return color_strength_ref, color_strength_dist, color_strength_diff
+
+
+def general_gaussian_func(x, bias, p_scalar, s_scalar, x_center):
+    y = np.exp(-(np.power(x - x_center, p_scalar) + bias) * s_scalar)
+    return y
+
+
+def chromatic_gaussian_score_func(x, p_scalar=2.5, s_scalar=100, slow_threshold=3, slow_s_scalar_ratio=2.1, slow_p_scalar_ratio=1.9):
+    bias = 0
+    x_center = 0
+    if x >= slow_threshold:
+        s_scalar_slow = s_scalar * slow_s_scalar_ratio
+        bias = (np.power(slow_threshold, p_scalar) * s_scalar) / s_scalar_slow
+        p_scalar = p_scalar * slow_p_scalar_ratio
+        s_scalar = s_scalar_slow
+        x_center = slow_threshold
+    y = general_gaussian_func(x, bias, p_scalar, s_scalar, x_center)
+    return y
+
+
+def var_biased_power_func(x, c_var_bias, p_scalar=2):
+    y = (1 / np.power(c_var_bias, p_scalar)) * np.power((x + c_var_bias), p_scalar) - 1
+    return y
+
+
+def p_scalar_pos(ref_color_strength, s_scalar, bias=0.0, a_scalar=1.0):
+    y = a_scalar * np.exp(-s_scalar*ref_color_strength) + bias
+    return y
+
+
+def p_scalar_neg(ref_color_strength, s_scalar, y_base=1.15):
+    y = s_scalar * np.tan((np.pi * ref_color_strength)/6) + y_base
+    return y
+
+
+def cal_chromatic_color_strength_score_ratio(color_strength_ref, strength_delta, p_s_scalar_pos=100.0, p_s_scalar_neg=100.0, gaussion_s_scalar=10.0, gaussion_a_scalar=1.0):
+    if strength_delta == 0:
+        score_ratio = 1
+    elif strength_delta > 0:
+        p_scalar = p_scalar_pos(color_strength_ref, p_s_scalar_pos, a_scalar=5.6392518847594735, bias=0)
+        #p_scalar = 0.35323510819674914#2.8930375122909573
+        s_scalar = p_scalar_pos(color_strength_ref, s_scalar=gaussion_s_scalar, a_scalar=gaussion_a_scalar, bias=0)
+        #s_scalar = 2.751847064314213#10506.096566786684
+        score_ratio = chromatic_gaussian_score_func(strength_delta, p_scalar=p_scalar, s_scalar=s_scalar)
+    else:
+        p_scalar = p_scalar_neg(color_strength_ref, p_s_scalar_neg)
+        score_ratio = var_biased_power_func(strength_delta, color_strength_ref, p_scalar=p_scalar)
+    return score_ratio
+
+
+def get_chromatic_color_strength_score_ratio(v_skewness_gray_diff_sub_ref, v_skewness_gray_diff_sub_dist, p_s_scalar_pos=55.071743597317834, p_s_scalar_neg=100, gaussion_s_scalar=215.9849212750911, gaussion_a_scalar=143968.492104378):
+    color_strength_ref, color_strength_dist, color_strength_diff = rgb_plane_mean_skewness_color_strength_diff(v_skewness_gray_diff_sub_ref, v_skewness_gray_diff_sub_dist)
+    score_ratio = cal_chromatic_color_strength_score_ratio(color_strength_ref, color_strength_diff, p_s_scalar_pos=p_s_scalar_pos, p_s_scalar_neg=p_s_scalar_neg, gaussion_s_scalar=gaussion_s_scalar, gaussion_a_scalar=gaussion_a_scalar)
+    return score_ratio
+
+
+def img_rgb_plane_mean_skewness_quality_diff_green_sign_dom(v_skewness_gray_diff_sub_ref, v_skewness_gray_diff_sub_dist, green_sig_scalar=1.1):
+    v_skewness_sub = np.abs(v_skewness_gray_diff_sub_dist) - np.abs(v_skewness_gray_diff_sub_ref)
+    green_sign = np.abs(np.sign(v_skewness_gray_diff_sub_ref[1]) - np.sign(v_skewness_gray_diff_sub_dist[1]))
+    if green_sign == 0:
+        v_skewness_sub = np.abs(v_skewness_gray_diff_sub_dist) - np.abs(v_skewness_gray_diff_sub_ref)
+    else:
+        v_skewness_sub = -1 * np.abs(v_skewness_gray_diff_sub_dist - v_skewness_gray_diff_sub_ref)
+    mean_skewness_quality_diff = np.sum(v_skewness_sub)
+    return mean_skewness_quality_diff
+
+
+def img_rgb_plane_mean_skewness_quality_diff_score(v_skewness_gray_diff_sub_ref, v_skewness_gray_diff_sub_dist, img_gray_dynamic_range_sub_sign=-1, s_scalar=15, bias=2.5):
+    mean_skewness_quality_diff = img_rgb_plane_mean_skewness_quality_diff(v_skewness_gray_diff_sub_ref, v_skewness_gray_diff_sub_dist)
+    #if img_gray_dynamic_range_sub_sign > 0:
+        #mean_skewness_quality_diff = np.abs(mean_skewness_quality_diff)
+    continuity_point = -0.08
+    if mean_skewness_quality_diff < continuity_point:
+        s_scalar_neg = 1
+        bias = img_gray_mean_skewness_diff_sigmoid_neg_flatten_bias(s_scalar, s_scalar_neg, bias, continuity_point)
+        s_scalar = s_scalar_neg
+    print("mean_skewness_quality_diff", mean_skewness_quality_diff)
+    mean_skewness_quality_diff_score = biased_sigmoid(mean_skewness_quality_diff, s_scalar=s_scalar, bias=bias)
+    return mean_skewness_quality_diff_score
+
+
+def img_gray_mean_skewness_diff_sigmoid_neg_flatten_bias(s_scalar_pos, s_scalar_neg, bias_pos, continuity_point):
+    bias_neg = (s_scalar_pos - s_scalar_neg)*continuity_point + bias_pos
+    return bias_neg
+
+
+def v_skewness_gray_diff_norm_sub_score(v_skewness_gray_diff_ref, v_skewness_gray_diff_dist):
+    v_skewness_gray_diff_ref_norm = np.linalg.norm(v_skewness_gray_diff_ref)
+    v_skewness_gray_diff_dist_norm = np.linalg.norm(v_skewness_gray_diff_dist)
+    #
+    print("v_skewness_gray_diff_ref_norm", v_skewness_gray_diff_ref_norm)
+    print("v_skewness_gray_diff_dist_norm", v_skewness_gray_diff_dist_norm)
+    #
+    norm_sub = v_skewness_gray_diff_dist_norm - v_skewness_gray_diff_ref_norm
+    norm_sub = norm_sub# / (v_skewness_gray_diff_dist_norm + v_skewness_gray_diff_ref_norm)
+    return norm_sub
+
+
+def img_rgb_chromatic_mean_skewness_metric(img_rgb_gray_ref, img_rgb_red_ref, img_rgb_green_ref, img_rgb_blue_ref, img_rgb_gray_dist, img_rgb_red_dist, img_rgb_green_dist, img_rgb_blue_dist):
+    gray_mean_skewness_ref, v_mean_skewness_ref = img_rgb_plane_mean_skewness(img_rgb_gray_ref, img_rgb_red_ref, img_rgb_green_ref, img_rgb_blue_ref)
+    gray_mean_skewness_dist, v_mean_skewness_dist = img_rgb_plane_mean_skewness(img_rgb_gray_dist, img_rgb_red_dist, img_rgb_green_dist, img_rgb_blue_dist)
+    v_skewness_gray_diff_ref = img_rgb_plane_mean_skewness_gray_diff_v(v_mean_skewness_ref, gray_mean_skewness_ref)
+    v_skewness_gray_diff_dist = img_rgb_plane_mean_skewness_gray_diff_v(v_mean_skewness_dist, gray_mean_skewness_dist)
+
+    #
+    norm_sub = v_skewness_gray_diff_norm_sub_score(v_skewness_gray_diff_ref, v_skewness_gray_diff_dist)
+    print("norm_sub:", norm_sub)
+    chromatic_metric_channel_wise = img_rgb_plane_mean_skewness_quality_diff_channel_wise(v_skewness_gray_diff_ref, v_skewness_gray_diff_dist)
+    chromatic_color_strength_score_ratio = get_chromatic_color_strength_score_ratio(v_skewness_gray_diff_ref, v_skewness_gray_diff_dist)
+    #chromatic_metric_channel_wise = img_rgb_plane_mean_skewness_quality_diff_green_sign_dom(v_skewness_gray_diff_ref, v_skewness_gray_diff_dist)
+    print("chromatic_metric_channel_wise", chromatic_metric_channel_wise)
+    print("chromatic_color_strength_score_ratio", chromatic_color_strength_score_ratio)
+    #
+
+    skewness_gray_diff_max_ref, v_skewness_gray_diff_sub_ref = img_rgb_plane_mean_skewness_gray_diff_max(v_mean_skewness_ref, gray_mean_skewness_ref)
+    skewness_gray_diff_max_dist, v_skewness_gray_diff_sub_dist = img_rgb_plane_mean_skewness_gray_diff_max(v_mean_skewness_dist, gray_mean_skewness_dist)
+
+    # test
+    print("v_skewness_gray_diff_sub_dist:", v_skewness_gray_diff_sub_ref)
+    print("v_skewness_gray_diff_sub_dist:", v_skewness_gray_diff_sub_dist)
+    # test
+
+    #test
+    #print(v_skewness_gray_diff_sub_dist - v_skewness_gray_diff_sub_ref, np.sum(v_skewness_gray_diff_sub_dist - v_skewness_gray_diff_sub_ref))
+    #mean_skewness_quality_diff = img_rgb_plane_mean_skewness_quality_diff(v_skewness_gray_diff_sub_ref, v_skewness_gray_diff_sub_dist)
+
+    img_gray_dynamic_range_sub, img_gray_dynamic_range_sub_sign = img_gray_dynamic_range_sub_cal(img_rgb_gray_ref, img_rgb_gray_dist)
+    skewness_diff_max_sub_score = img_rgb_plane_mean_skewness_quality_diff_score(v_skewness_gray_diff_sub_ref, v_skewness_gray_diff_sub_dist, img_gray_dynamic_range_sub_sign=img_gray_dynamic_range_sub_sign)
+
+    #print(biased_sigmoid(mean_skewness_quality_diff, s_scalar=25, bias=4))
+    #test
+    v_skewness_diff_sub, v_skewness_diff_distance_score = img_rgb_plane_mean_skewness_diff_v_dist_ref_distance(v_skewness_gray_diff_ref, v_skewness_gray_diff_dist)
+    #
+    print("v_skewness_distance:", v_skewness_diff_sub)
+    #
+    #skewness_diff_max_sub, skewness_diff_max_sub_score = img_rgb_plane_mean_skewness_diff_v_dist_ref_max_diff(skewness_gray_diff_max_ref, skewness_gray_diff_max_dist)
+    return v_skewness_diff_distance_score, skewness_diff_max_sub_score
+
+
+def img_gray_sim_metrics(img_gray_ref, img_gray_dist, seg_num, is_segment_mod, centroid_num, C_PC=1, C_HIST=0.001, C_SUM=0.001, C_GRAD=0.001, C_DYNA_R=0.001, mean_scalar=10, kernel_size=(3, 3), conv_mode='same', denoise_threshold=9, C_SIG=0.01, is_rec_aligned=True):
+    img_gray_1 = img_gray_ref
+    img_gray_2 = img_gray_dist
+
+    img_plane_list_1, img_gray_plane_sum_1, img_gray_rec_1 = img_gray_adjusted_planes_extraction_cluster(img_gray_1, seg_num=seg_num, is_segment_mod=is_segment_mod, centroid_num=centroid_num, is_rec_aligned=is_rec_aligned)
+    img_plane_list_2, img_gray_plane_sum_2, img_gray_rec_2 = img_gray_adjusted_planes_extraction_cluster(img_gray_2, seg_num=seg_num, is_segment_mod=is_segment_mod, centroid_num=centroid_num, is_rec_aligned=is_rec_aligned)
+
+    #img_plane_list_1_s, img_gray_plane_sum_1_s, img_gray_rec_1_s = img_gray_adjusted_planes_extraction_cluster(img_gray_1, seg_num=8, is_segment_mod=is_segment_mod, centroid_num=centroid_num, is_rec_aligned=is_rec_aligned)
+    #img_plane_list_2_s, img_gray_plane_sum_2_s, img_gray_rec_2_s = img_gray_adjusted_planes_extraction_cluster(img_gray_2, seg_num=8, is_segment_mod=is_segment_mod, centroid_num=centroid_num, is_rec_aligned=is_rec_aligned)
+
+    img_gray_hist_correlation_matrix, img_gray_hist_correlation = img_plane_hist_diff2_correlation(img_gray_1, img_gray_2, C=C_HIST)
+
+    #pc_sum_correlation_matrix, pc_sum_correlation = img_plane_pc_correlation(img_gray_rec_1, img_gray_rec_2, C=C_PC)
+    pc_sum_correlation_matrix, pc_sum_correlation = img_plane_pc_correlation(img_gray_1, img_gray_2, C=C_PC)
+    #pc_sum_correlation_matrix, pc_sum_correlation = img_plane_pc_correlation(img_gray_plane_sum_1, img_gray_plane_sum_2, C=C_PC)
+
+    img_plane_sum_correlation_matrix, img_plane_sum_correlation = hvs_sim_img_plane_correlation_cal(img_gray_plane_sum_1, img_gray_plane_sum_2, C=C_SUM)
+
+    #img_plane_correlation_mean = img_gray_plane_mean_diff(img_gray_1, img_gray_2, mean_scalar=mean_scalar)
+    img_plane_correlation_mean = img_gray_plane_mean_positive_negative_diff_diff(img_gray_1, img_gray_2, mean_scalar=mean_scalar)
+
+    #img_plane_correlation_gradient_matrix, img_plane_correlation_gradient = hvs_sim_img_plane_correlation_cal(np.round(img_gray_rec_1*255, 0), np.round(img_gray_rec_2*255, 0), C=C_GRAD)
+    img_plane_correlation_gradient_matrix, img_plane_correlation_gradient = img_gray_plane_gradient_correlation(img_gray_1, img_gray_2, C=C_GRAD)
+    #img_plane_correlation_gradient_matrix, img_plane_correlation_gradient = img_gray_plane_gradient_correlation(img_gray_rec_1_b, img_gray_rec_2_b, C=C_GRAD)
+
+    plane_signal_level_correlation = img_gray_plane_signal_level_correlation(img_plane_list_1, img_plane_list_2, kernel_size=kernel_size, conv_mode=conv_mode, denoise_threshold=denoise_threshold, C=C_SIG)
+
+    #img_dynamic_range_correlation = img_gray_dynamic_range_sim(img_gray_1, img_gray_2, C=C_DYNA_R)
+    img_dynamic_range_correlation, img_gray_dynamic_range_sub_sign = img_gray_dynamic_range_positive_negative_diff_sim(img_gray_1, img_gray_2, C=C_DYNA_R)
+
+    img_gray_planes_binary_shape_sim_val = img_gray_planes_binary_shape_sim(img_plane_list_1, img_plane_list_2)
+
+    skewness_diff, skewness_diff_score = img_gray_mean_skewness_diff(img_gray_1, img_gray_2)
+
+    return pc_sum_correlation, img_gray_hist_correlation, img_plane_sum_correlation, img_plane_correlation_mean, img_plane_correlation_gradient, plane_signal_level_correlation, img_dynamic_range_correlation, img_gray_planes_binary_shape_sim_val, skewness_diff_score
+
+
+def cal_p_s_scalar_gaussian(x1, x2, v1, v2):
+    v3 = np.log(v1) / np.log(v2)
+    x3 = x1 / x2
+    p_scalar = np.log(v3) / np.log(x3)
+    s_scalar = -np.log(v2) / np.power(x2, p_scalar)
+    return p_scalar, s_scalar
+
+
+def cal_a_s_scalar_gaussian_p(c1, c2, v1, v2):
+    c3 = 1 / (c1 - c2)
+    v3 = v1 / v2
+    s_scalar = -c3 * np.log(v3)
+    a_scalar = v1/(np.exp(-s_scalar * c1))
+    return s_scalar, a_scalar

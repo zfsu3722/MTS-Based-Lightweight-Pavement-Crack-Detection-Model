@@ -37,6 +37,10 @@ model.to(DEVICE)
 
 optimizer = optim.Adam(model.parameters(), lr=0.001)
 
+# --- MODIFICATION START: REMOVED metric_mode VARIABLE ---
+# The metric_mode variable is no longer needed as we will calculate all metrics.
+# --- MODIFICATION END ---
+
 num_epochs = 50
 best_model_state_dict = None
 best_f1 = 0
@@ -131,18 +135,28 @@ for epoch in range(num_epochs + 1):
 
         vloss_avg = np.array(vlosses).mean()
         print(f'Epoch [{epoch}/{num_epochs}], tLoss: {tloss_avg:.6f}, vLoss: {vloss_avg:.6f}')
+
+        # --- MODIFICATION START: CALCULATE ALL METRICS ---
         print("\n--- Calculating Performance Metrics for Epoch {} ---".format(epoch))
 
+        # 1. Calculate Precision, Recall, F1-Score
+        # Note: The second argument should be the list of ground truth tensors corresponding to the predictions.
         prf_results = cal_prf_metrics(fused_list_reconstructed, test_label_list, epoch)
+
+        # 2. Calculate PA, MPA, MIoU
         semantic_results = cal_semantic_metrics(fused_list_reconstructed, test_label_list, epoch)
 
         print("--- Metrics Calculation Complete ---\n")
-        if prf_results:
+
+        # 3. Check for best model based on F1-Score
+        if prf_results:  # Ensure prf_results is not empty
             f1 = prf_results[0][3]
             if f1 > best_f1:
                 best_f1 = f1
                 best_pred_list = fused_list_reconstructed
                 best_test_label_list = test_label_list
+                # Note: 'image_name' is from the last loop item. For a robust implementation,
+                # you might want to save all test image names in a list during the loop.
                 best_epoch = epoch
                 with open('best_epoch2.txt', 'w') as f:
                     f.write(str(best_epoch))
@@ -162,10 +176,11 @@ for epoch in range(num_epochs + 1):
                     test_label_array = (test_label.squeeze().squeeze().cpu().numpy() * 255).astype('uint8')
                     cv2.imwrite(output_filename, pred_binary_array)
                     cv2.imwrite(output_filename1, test_label_array)
+        # --- MODIFICATION END ---
 
 checkpoint1 = {
-    'model_state_dict': best_model_state_dict,
+    'model_state_dict': best_model_state_dict,  # This should be model.state_dict() if you want to save the best model
     'optimizer_state_dict': optimizer.state_dict(),
     'epoch': best_epoch
 }
-
+# torch.save(checkpoint1, 'best_model_checkpoint.pth') # You should save the best model state inside the if f1 > best_f1 block
