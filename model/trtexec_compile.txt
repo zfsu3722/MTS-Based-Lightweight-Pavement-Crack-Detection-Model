@@ -1,0 +1,1 @@
+/usr/src/tensorrt/bin/trtexec   --onnx=mtscrack_ultimate_bgr.onnx   --saveEngine=mts_neural.engine   --fp16   --workspace=1024   --verbos
