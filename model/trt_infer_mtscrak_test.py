@@ -27,7 +27,7 @@ i = 0
 start_evt = cuda.Event()
 end_evt   = cuda.Event()
 start_evt.record()
-for i in range(1):
+for i in range(1000):
     #thresholds = cr5_seg.img_integer_segmentation_equal_range_thresholds_float_cpu(img_gray, seg_num)
 
     #img_planes_tensor = cr5_seg.img_segmentation_threshold_list_cpu(img_gray, thresholds)
